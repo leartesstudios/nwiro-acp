@@ -18,6 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history so the on-main ancestry check below can resolve.
+          fetch-depth: 0
       - name: Assert Cargo.toml version matches the release tag
         shell: bash
         run: |
@@ -28,6 +31,19 @@ jobs:
             echo "::error::Release tag ${GITHUB_REF_NAME} (version '${tag_version}') does not match Cargo.toml version '${cargo_version}'. Bump Cargo.toml or retag."
             exit 1
           fi
+      - name: Assert the release tag is on main (releases come from main only)
+        shell: bash
+        run: |
+          # Branch model: work lands on `development` and merges to `main` via PR.
+          # A release MUST be tagged from a commit that is on main — never a stray
+          # development/feature commit. Tags are NOT covered by branch protection,
+          # so this is the gate that actually enforces "release from main only".
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main. Merge to main via PR first, then tag the main commit."
+            exit 1
+          fi
+          echo "OK: ${GITHUB_REF_NAME} is on main."
 
   # Legal gate (P0-F): every distributed binary must ship third-party attribution.
   # Fails the release on a non-distribution-compatible license or a known security
@@ -47,11 +63,13 @@ jobs:
         run: cargo deny check advisories licenses
       - name: Generate third-party attribution NOTICE (fresh from Cargo.lock)
         run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
-      - name: Attach NOTICE to the release
-        uses: softprops/action-gh-release@v3
+      - name: Upload the NOTICE as a build artifact (the release job publishes it)
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: THIRD-PARTY-LICENSES.md
+          name: dist-notice
+          path: THIRD-PARTY-LICENSES.md
+          if-no-files-found: error
+          retention-days: 1
 
   build:
     needs: verify-version
@@ -151,11 +169,54 @@ jobs:
           rm 'local-llm-acp'
           echo "ASSET_FILE=$ASSET_NAME" >> "$GITHUB_ENV"
 
-      - name: Upload to release
-        # @v3 (released 2026-04-12) ships the Node.js 24 runtime — pins us
-        # ahead of GitHub's June 2026 forced Node 20 → 24 migration that
-        # @v2 was tripping deprecation warnings about.
+      - name: Upload the packaged asset as a build artifact
+        # NOT attached to the release here — the `release` job below assembles
+        # ALL targets and publishes them in one shot, so a single failed target
+        # can never leave a PARTIAL release that 404s the nwiro auto-updater.
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ env.ASSET_FILE }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Atomic publish. Runs ONLY if ALL 6 build legs AND the licenses job succeed:
+  # a matrix job counts as failed if any leg fails, so `needs: build` skips this
+  # job on a partial failure → the release is never created with a partial asset
+  # set. Assembles every artifact, generates SHA256SUMS, and publishes in one shot.
+  release:
+    needs: [build, licenses]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Assert all 6 platform binaries are present before publishing
+        shell: bash
+        run: |
+          cd dist
+          ls -1
+          count=$(ls local-llm-acp-* 2>/dev/null | wc -l)
+          echo "platform binaries found: $count (expected 6)"
+          [ "$count" -eq 6 ] || { echo "::error::expected 6 platform binaries, found $count — refusing to publish a partial release"; exit 1; }
+
+      - name: Generate SHA256SUMS for the binaries
+        shell: bash
+        run: |
+          cd dist
+          sha256sum local-llm-acp-* > SHA256SUMS
+          echo "----- SHA256SUMS -----"; cat SHA256SUMS
+
+      - name: Publish the release with ALL assets at once (atomic)
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          files: ${{ env.ASSET_FILE }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/local-llm-acp-*
+            dist/SHA256SUMS
+            dist/THIRD-PARTY-LICENSES.md

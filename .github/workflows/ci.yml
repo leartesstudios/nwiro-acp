@@ -1,13 +1,15 @@
 name: CI
 
-# Build + test on every push and PR to main. release.yml only fires on
-# version tags and only cross-compiles (no tests), so without this workflow
-# nothing validates day-to-day commits. The golden-transcript suite is the
-# Wave 1 regression gate — it only protects the connector refactor if a runner
-# actually executes it on each push.
+# Build + test on every push to main/development and every PR to main. The PR
+# run is the status check main's branch protection requires — work lands on
+# `development` and merges to `main` via PR (no direct pushes to main).
+# release.yml only fires on version tags and only cross-compiles (no tests), so
+# without this workflow nothing validates day-to-day commits. The
+# golden-transcript suite is the Wave 1 regression gate — it only protects the
+# connector refactor if a runner actually executes it on each push.
 on:
   push:
-    branches: [main]
+    branches: [main, development]
   pull_request:
     branches: [main]
 
