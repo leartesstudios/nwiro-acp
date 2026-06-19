@@ -1,0 +1,23 @@
+---
+source: src/acp/golden.rs
+expression: frames
+---
+[
+  {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "serverCapabilities": {
+        "session": {
+          "cancel": true,
+          "prompt": true,
+          "setConfigOption": true
+        }
+      },
+      "serverInfo": {
+        "name": "local-llm-acp",
+        "version": "[version]"
+      }
+    }
+  }
+]

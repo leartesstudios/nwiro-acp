@@ -1,0 +1,119 @@
+---
+source: src/acp/golden.rs
+expression: frames
+---
+[
+  {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "serverCapabilities": {
+        "session": {
+          "cancel": true,
+          "prompt": true,
+          "setConfigOption": true
+        }
+      },
+      "serverInfo": {
+        "name": "local-llm-acp",
+        "version": "[version]"
+      }
+    }
+  },
+  {
+    "id": 2,
+    "jsonrpc": "2.0",
+    "result": {
+      "sessionId": "[session-id]"
+    }
+  },
+  {
+    "id": 3,
+    "jsonrpc": "2.0",
+    "result": {}
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "[session-id]",
+      "update": {
+        "rawInput": {
+          "arguments": {
+            "searchTerm": "door"
+          }
+        },
+        "sessionUpdate": "tool_call",
+        "status": "pending",
+        "title": "find_blueprints",
+        "toolCallId": "call_1"
+      }
+    }
+  },
+  {
+    "id": "[mcp-id]",
+    "jsonrpc": "2.0",
+    "method": "mcp/connect",
+    "params": {}
+  },
+  {
+    "id": "[mcp-id]",
+    "jsonrpc": "2.0",
+    "method": "mcp/message",
+    "params": {
+      "connectionId": "test-conn",
+      "message": {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+          "arguments": {
+            "searchTerm": "door"
+          },
+          "name": "find_blueprints"
+        }
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "[session-id]",
+      "update": {
+        "rawOutput": {
+          "content": [
+            {
+              "text": "3 door blueprints",
+              "type": "text"
+            }
+          ],
+          "isError": false
+        },
+        "sessionUpdate": "tool_call_update",
+        "status": "completed",
+        "toolCallId": "call_1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "[session-id]",
+      "update": {
+        "content": {
+          "text": "found 3 door blueprints",
+          "type": "text"
+        },
+        "sessionUpdate": "agent_message_chunk"
+      }
+    }
+  },
+  {
+    "id": 4,
+    "jsonrpc": "2.0",
+    "result": {
+      "stopReason": "end_turn"
+    }
+  }
+]

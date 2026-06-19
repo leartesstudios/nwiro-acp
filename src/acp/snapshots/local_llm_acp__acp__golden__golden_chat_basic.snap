@@ -1,0 +1,70 @@
+---
+source: src/acp/golden.rs
+expression: frames
+---
+[
+  {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "serverCapabilities": {
+        "session": {
+          "cancel": true,
+          "prompt": true,
+          "setConfigOption": true
+        }
+      },
+      "serverInfo": {
+        "name": "local-llm-acp",
+        "version": "[version]"
+      }
+    }
+  },
+  {
+    "id": 2,
+    "jsonrpc": "2.0",
+    "result": {
+      "sessionId": "[session-id]"
+    }
+  },
+  {
+    "id": 3,
+    "jsonrpc": "2.0",
+    "result": {}
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "[session-id]",
+      "update": {
+        "content": {
+          "text": "hello",
+          "type": "text"
+        },
+        "sessionUpdate": "agent_message_chunk"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "[session-id]",
+      "update": {
+        "content": {
+          "text": " world",
+          "type": "text"
+        },
+        "sessionUpdate": "agent_message_chunk"
+      }
+    }
+  },
+  {
+    "id": 4,
+    "jsonrpc": "2.0",
+    "result": {
+      "stopReason": "end_turn"
+    }
+  }
+]

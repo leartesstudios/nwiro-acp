@@ -1,0 +1,137 @@
+# Model registry for the test harness (docs/MODEL-TEST-PLAN.md).
+# Adding a model = one [[model]] stanza, zero code.
+#
+# scripts/tool-curve.py  (Layer 1, shim-free) reads: id, backend, base_url,
+#                        gold_tool, curve_points, expected_ceiling.
+# scripts/model-matrix.py (Layer 2, E2E)       additionally reads: expected_tier,
+#                        timeout_secs, shim_bin, and the reproducibility env.
+
+[defaults]
+# Reproducibility env the harness pins in every manifest header (MODEL-TEST-PLAN §4).
+# NOTE: probe_timeout_secs is NWIRO_LOCAL_LLM_PROBE_TIMEOUT_SECS — distinct from the
+# shim's MCP timeout (NWIRO_LOCAL_LLM_MCP_TIMEOUT_SECS). Do not conflate.
+probe_timeout_secs = 30
+high_tool_warn = 150
+bleed_guard = "on"            # flip "off" per-cell to capture a RAW collapse fixture for CI replay
+curve_points = [1, 30, 80, 150, 220]   # T-C fixed N (FINDINGS Finding J — keep results comparable)
+gold_tool = "find_blueprints"          # the probe keys Native on this tool name (client.rs)
+shim_bin = "target/release/local-llm-acp.exe"
+
+# --- Anchors (build + run these FIRST; they guard the whole detection stack) ---
+
+[[model]]
+id = "qwen3:14b"
+role = "green-anchor"               # REFERENCE PASS — every run diffs against it
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "native"
+expected_ceiling = 220              # validated live at 220 tools
+timeout_secs = 120
+
+[[model]]
+id = "glm-4-9b-chat"
+role = "red-anchor"                 # REFERENCE FAIL — canonical schema-bleed + ceiling-29
+backend = "lmstudio"
+base_url = "http://127.0.0.1:1234/v1"
+expected_tier = "native"            # v0.2.6: probe uses string tool_choice (LM-Studio-compatible) → GLM probes Native; schema-bleed contained by the Native-tier buffer (should_buffer_tool_content keys off the ceiling), not the Emulated path
+expected_ceiling = 29               # model_family.rs::recommended_tool_ceiling
+timeout_secs = 120
+
+# v0.2.6 GLM preset-robustness variants (different generation/template than the 9B-chat anchor).
+[[model]]
+id = "thudm_glm-z1-9b-0414"
+role = "glm-variant"                # GLM-Z1 reasoning gen — different template/preset + emits <think>; id does NOT start with "glm" (tests model_family::detect)
+backend = "lmstudio"
+base_url = "http://127.0.0.1:1234/v1"
+expected_tier = "native"
+timeout_secs = 180
+
+[[model]]
+id = "thudm_glm-4-32b-0414"
+role = "glm-variant"                # GLM-4 32B newer gen — different template; tests detect + bleed-onset vs ceiling at scale
+backend = "lmstudio"
+base_url = "http://127.0.0.1:1234/v1"
+expected_tier = "native"
+timeout_secs = 240
+
+# --- Fill these as the models are pulled (MODEL-TEST-PLAN §1 M2/M3/M5/M6/M7/M8) ---
+
+[[model]]
+id = "qwen2.5:7b-instruct"
+role = "qwen-floor"
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "native"
+timeout_secs = 120
+
+[[model]]
+id = "llama3.1:8b-instruct-q4_K_M"
+role = "llama-dialect"
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "native"
+timeout_secs = 120
+
+[[model]]
+id = "mistral-nemo:12b-instruct-2407-q4_K_M"
+role = "mistral-dialect"
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "native"
+timeout_secs = 120
+
+[[model]]
+id = "hermes-3-llama-3.1-8b"
+role = "emulated-xml"               # <tool_call> XML fine-tune — exercises the Emulated parser
+backend = "lmstudio"
+base_url = "http://127.0.0.1:1234/v1"
+expected_tier = "emulated"
+timeout_secs = 120
+
+[[model]]
+id = "qwen3-30b-a3b"
+role = "qwen-moe"                   # M3 — MoE Native on a non-Ollama backend (LM Studio)
+backend = "lmstudio"
+base_url = "http://127.0.0.1:1234/v1"
+expected_tier = "native"
+timeout_secs = 180                  # 30B MoE + JIT load headroom
+
+[[model]]
+id = "gemma2:9b-instruct-q4_K_M"
+role = "control"                    # no tool fine-tune — must degrade cleanly, not garble
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "none"
+timeout_secs = 120
+
+[[model]]
+id = "qwen3:4b"
+role = "qwen-overcall"              # chronic Finding-L identical-success-loop reproducer (must end at N=3)
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "native"
+timeout_secs = 120
+
+[[model]]
+id = "phi4"
+role = "control-describe"           # None/weak via describe path (other half of Finding K)
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "none"
+timeout_secs = 120
+
+[[model]]
+id = "deepseek-r1:14b"
+role = "reasoning-think"            # emits <think>…</think> — exercises the ThinkStripper (G-MODEL-1)
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "native"            # Qwen2.5-14B distill base; run classifies the real tier
+timeout_secs = 180                  # reasoning models stream long CoT — wider ceiling
+
+[[model]]
+id = "gpt-oss:20b"
+role = "empty-response"            # validates the stream-delta-coalescing fix (Finding I) live
+backend = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+expected_tier = "native"           # OpenAI open model; run classifies the real tier
+timeout_secs = 150

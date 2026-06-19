@@ -1,0 +1,70 @@
+# Rust build artifacts
+/target
+
+# Release packaging artifacts. CI generates these in the workspace root
+# (Compress-Archive on Windows, tar czf on Unix) before uploading them
+# to the GitHub release. Local repro of the packaging step would
+# otherwise leave these in the repo root and tempt accidental `git add`.
+/local-llm-acp-*.zip
+/local-llm-acp-*.tar.gz
+
+# Per-user lockfiles for binaries are committed (Cargo.lock is tracked) but
+# editor / debugger swap files are not.
+*.swp
+*.swo
+
+# IDE state
+/.idea/
+/.vscode/
+
+# Council / verification artifacts — research reports, council outputs, fetched
+# primary sources used to audit the shim. Local-only; do not ship in the repo.
+/reports/
+
+# Campaign planning scratch — council briefs, todo checklists, lessons captures,
+# synthetic test payloads. Local-only; the durable campaign output (runbooks,
+# results) lives in /docs/ instead.
+/tasks/
+
+# Obsolete RunPod-era infrastructure left behind after the local-Blackwell
+# pivot. Kept gitignored rather than deleted so the operator can choose when
+# to remove it from their working tree.
+/docker/
+
+# Stray Windows file-metadata directories that Windows file ops occasionally
+# leave behind in the working tree. Never useful in a Rust crate.
+/Microsoft/
+
+# Python bytecode caches from campaign scripts. Never tracked.
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Internal-only docs — engineering handoffs, threat models, roadmaps, and
+# investigation briefs that reference the private nwiro codebase. Never publish;
+# they live in the private working repo only. Guarded here so an accidental
+# `git add docs` cannot re-introduce them into the public snapshot.
+/docs/FINAL-PUBLISH-TEST-PLAN.md
+/docs/RENDER-GAP-VERIFICATION.md
+/docs/NWIRO-HANDOFF.md
+/docs/AGENT-HANDOFF.md
+/docs/TOOL-SURFACE-OVERLOAD.md
+/docs/NWIRO-TOOL-FILTERING-SPEC.md
+/docs/NWIRO-TOOL-OBSERVABILITY-SPEC.md
+/docs/M-1-INVESTIGATION-BRIEF.md
+/docs/WAVE-1-IMPLEMENTATION-PLAN.md
+/docs/WAVE-1-REVIEW.md
+/docs/ROADMAP.md
+/docs/COMPARISON-AND-ROADMAP.md
+/docs/CONNECTOR-GAP-ANALYSIS.md
+/docs/FINDINGS.md
+/docs/M2-M6-TEST-RUNBOOK.md
+/docs/M2-M6-V0.1.39-RETEST.md
+/docs/VERIFY-GAP5-OPENROUTER.md
+
+# Stray test-result archives (internal test logs). Never ship in a public repo.
+/test/
+*.zip

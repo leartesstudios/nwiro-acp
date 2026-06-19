@@ -1,0 +1,47 @@
+[package]
+name = "local-llm-acp"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "ACP-to-OpenAI shim for Nwiro local LLM support"
+repository = "https://github.com/leartesstudios/nwiro-acp"
+homepage = "https://github.com/leartesstudios/nwiro-acp"
+readme = "README.md"
+authors = ["Leartes Studios"]
+keywords = ["acp", "llm", "openai", "ollama", "unreal"]
+categories = ["command-line-utilities"]
+
+# rustls-tls is REQUIRED across all targets — native-tls breaks aarch64-pc-windows-msvc.
+# Never add native-tls features here or in any dependency.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# SSE parsing for OpenAI streaming chat completions. Used by openai/client.rs +
+# openai/stream.rs to chunk the response body into events.
+eventsource-stream = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+futures-util = "0.3"
+# Wraps a tokio mpsc Receiver as a Stream (UnboundedReceiverStream) for the
+# connector's prompt() event stream (W1-08).
+tokio-stream = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+mockito = "1"
+tokio = { version = "1", features = ["test-util"] }
+# Snapshot testing for golden-transcript regression (Wave 1 W1-01). Frames are
+# captured via frame::CaptureSink and asserted with assert_json_snapshot!.
+insta = { version = "1", features = ["json", "redactions"] }
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+codegen-units = 1

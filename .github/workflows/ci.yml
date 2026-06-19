@@ -1,0 +1,80 @@
+name: CI
+
+# Build + test on every push and PR to main. release.yml only fires on
+# version tags and only cross-compiles (no tests), so without this workflow
+# nothing validates day-to-day commits. The golden-transcript suite is the
+# Wave 1 regression gate — it only protects the connector refactor if a runner
+# actually executes it on each push.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-progress run when a newer commit lands on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The production target the shim actually ships to (UE5 on Windows).
+          # The golden harness is explicitly exercised here per the Wave 1 plan.
+          - os: windows-latest
+          # Fast Linux feedback (catches portability regressions early).
+          - os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (all targets)
+        run: cargo build --all-targets
+
+      - name: Test (bin unit + golden suite)
+        run: cargo test --bins
+
+      - name: Test connector path (golden byte-identity under the flag)
+        # The W1-09 switchover gate: the same golden transcripts MUST stay
+        # byte-for-byte-normalized identical when the runtime is driven through
+        # AgentRuntimeConnector (LOCAL_LLM_USE_CONNECTOR=1). Without this step the
+        # connector path — the entire W1-09 deliverable — has no CI coverage and
+        # the byte-identity gate is only ever checked by hand. `env:` is used (not
+        # an inline VAR= prefix) so it works on both the pwsh and bash runners.
+        env:
+          LOCAL_LLM_USE_CONNECTOR: "1"
+        run: cargo test --bins golden
+
+  # License compliance gate (P0-F). A dependency bump that pulls in a
+  # non-distribution-compatible license must fail here, on the PR, rather
+  # than at release time. Mirrors the hard gate in release.yml.
+  licenses:
+    name: license compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install cargo-deny (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Check dependency licenses + security advisories
+        run: cargo deny check advisories licenses
+      - name: Assert the committed THIRD-PARTY-LICENSES.md is not stale
+        # Version-robust freshness guard (a full `cargo about generate` + diff would
+        # couple to the exact cargo-about version and false-fail). The NOTICE's own
+        # self-version is the part that silently rotted (shipped 0.2.7 after the 0.3.0
+        # bump); the shipped artifact is always regenerated fresh in release.yml regardless.
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          grep -qF "local-llm-acp $v" THIRD-PARTY-LICENSES.md \
+            || { echo "::error::THIRD-PARTY-LICENSES.md is stale (expected 'local-llm-acp $v') — regenerate with 'cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md' and commit."; exit 1; }
