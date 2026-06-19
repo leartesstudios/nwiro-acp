@@ -30,6 +30,13 @@ jobs:
           - os: windows-latest
           # Fast Linux feedback (catches portability regressions early).
           - os: ubuntu-latest
+          # macOS (Apple Silicon) is a release target (release.yml ships both
+          # apple-darwin arches) but was previously only cross-compiled at tag
+          # time, never tested. Run the full build+test+golden suite natively on
+          # arm64 so mac-specific compile/link/test breaks surface on the PR
+          # instead of at release. The Unix logic overlaps with ubuntu, so this
+          # is mainly a macOS toolchain/link guard.
+          - os: macos-14
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
