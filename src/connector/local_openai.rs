@@ -225,9 +225,21 @@ impl AgentRuntimeConnector for LocalOpenAiConnector {
             let mut guard = state.lock().await;
 
             // Build the ACP-shaped request the reused bridge runtime expects.
+            // Rebuild the ACP prompt array: the text block plus any image blocks
+            // (Phase 2). `handle_session_prompt` re-derives text + images via
+            // `content_parts()` and gates on model vision support.
+            let mut prompt_blocks =
+                vec![serde_json::json!({ "type": "text", "text": prompt.text })];
+            for img in &prompt.images {
+                prompt_blocks.push(serde_json::json!({
+                    "type": "image",
+                    "data": img.data,
+                    "mimeType": img.mime,
+                }));
+            }
             let mut params = serde_json::json!({
                 "sessionId": guard.session_id,
-                "prompt": [{ "type": "text", "text": prompt.text }],
+                "prompt": prompt_blocks,
             });
             if let Some(tools) = prompt.tools {
                 params["tools"] = tools;
@@ -345,7 +357,11 @@ impl AgentRuntimeConnector for LocalOpenAiConnector {
         ConnectorCapabilities {
             supports_cancellation: true,
             supports_parallel_tools: false,
-            supports_image_input: false,
+            // Phase 2: reflects whether the configured model is vision-capable
+            // (registry + NWIRO_LOCAL_LLM_FORCE_VISION override). The actual
+            // image gate lives in `handle_session_prompt`; this surfaces the
+            // same signal for capability reporting.
+            supports_image_input: crate::vision::model_supports_vision(self.client.model()),
             supports_usage_accounting: false,
             max_context_tokens: None,
         }

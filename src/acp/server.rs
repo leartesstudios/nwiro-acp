@@ -738,8 +738,10 @@ impl Server {
                             match serde_json::from_value::<SessionPromptParams>(params.clone()) {
                                 Ok(p) => {
                                     let sid = p.session_id.clone();
+                                    let (text, images) = p.content_parts();
                                     let cprompt = ConnectorPrompt {
-                                        text: p.text_content(),
+                                        text,
+                                        images,
                                         tools: p.tools.map(serde_json::Value::Array),
                                     };
                                     let (_handle, mut stream) =
@@ -1056,19 +1058,33 @@ impl Server {
             }
         }
 
-        // Never advertise terminal — blockCommandExecution is always-on per PLAN.md.
+        // Spec-correct ACP `initialize` result: `agentCapabilities` /
+        // `agentInfo` / `protocolVersion` / `authMethods` (the bridge already
+        // reads these; the old non-spec `serverCapabilities`/`serverInfo` keys it
+        // never read). `promptCapabilities.image` reflects whether the configured
+        // model is vision-capable so the host can gate image emission. Never
+        // advertise terminal — blockCommandExecution is always-on per PLAN.md.
+        let supports_vision = crate::vision::model_supports_vision(self.client.model());
         json!({
-            "serverCapabilities": {
+            "protocolVersion": 1,
+            "agentInfo": {
+                "name": "local-llm-acp",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "agentCapabilities": {
+                "loadSession": false,
+                "promptCapabilities": {
+                    "image": supports_vision,
+                    "audio": false,
+                    "embeddedContext": false
+                },
                 "session": {
                     "prompt": true,
                     "setConfigOption": true,
                     "cancel": true
                 }
             },
-            "serverInfo": {
-                "name": "local-llm-acp",
-                "version": env!("CARGO_PKG_VERSION")
-            }
+            "authMethods": []
         })
     }
 

@@ -4,6 +4,7 @@ mod connector;
 mod error;
 mod model_family;
 mod openai;
+mod vision;
 
 // Re-export at crate root so submodules can `use crate::ShimError` /
 // `use crate::Result` without going through the longer error:: path.

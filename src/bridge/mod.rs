@@ -843,16 +843,73 @@ fn estimate_emulated_directive_overhead(tier: ToolTier, tool_names: &[String]) -
 fn merge_directive_into_system(msgs: &mut Vec<ChatMessage>, directive: &str) {
     if let Some(first) = msgs.first_mut() {
         if matches!(first.role, crate::openai::messages::Role::System) {
-            if let Some(existing) = first.content.as_mut() {
+            if let Some(existing) = first.content.as_mut().and_then(|c| c.as_text_mut()) {
                 existing.push_str("\n\n");
                 existing.push_str(directive);
             } else {
-                first.content = Some(directive.to_string());
+                first.content = Some(directive.to_string().into());
             }
             return;
         }
     }
     msgs.insert(0, ChatMessage::system(directive.to_string()));
+}
+
+/// History image policy: downgrade any multimodal (image-bearing) user message
+/// in `history` to text-only, replacing the image parts with a short placeholder.
+/// Called at the start of each prompt turn so base64 images from PRIOR turns are
+/// not re-sent (and re-billed) on every subsequent turn; the current turn's
+/// images are added afterwards and stay intact for this turn's request.
+fn strip_history_images(history: &mut [ChatMessage]) {
+    use crate::openai::messages::MessageContent;
+    for msg in history.iter_mut() {
+        if matches!(msg.content, Some(MessageContent::Parts(_))) {
+            let text = msg.content_text().unwrap_or("").to_string();
+            msg.content = Some(MessageContent::Text(format!(
+                "{text}\n\n[image attachment(s) from an earlier turn omitted to save context]"
+            )));
+        }
+    }
+}
+
+/// Build the `role:user` message for a prompt turn, routing image content:
+/// no images → a plain text message (byte-identical wire); images + a
+/// vision-capable model → an OpenAI multimodal message (text + `image_url`
+/// parts); images + a text-only model → text plus a visible omission note
+/// (never a silent drop).
+fn build_user_message(
+    text: String,
+    images: Vec<crate::acp::messages::ImageInput>,
+    vision_capable: bool,
+    model: &str,
+) -> ChatMessage {
+    if images.is_empty() {
+        return ChatMessage::user(text);
+    }
+    if vision_capable {
+        tracing::info!(
+            model,
+            n_images = images.len(),
+            "vision-capable model — forwarding image(s) as OpenAI image_url content"
+        );
+        ChatMessage::user_multimodal(
+            text,
+            images.into_iter().map(|i| (i.mime, i.data)).collect(),
+        )
+    } else {
+        let n = images.len();
+        tracing::warn!(
+            model,
+            n_images = n,
+            "model is not vision-capable — dropping image(s) with an omission note \
+             (set NWIRO_LOCAL_LLM_FORCE_VISION=on to force, or use a vision model)"
+        );
+        ChatMessage::user(format!(
+            "{text}\n\n[{n} image attachment(s) omitted: the current model has no vision \
+             support. Switch to a vision-capable model (e.g. qwen2.5-vl, llava, \
+             llama3.2-vision) to use images.]"
+        ))
+    }
 }
 
 /// Drive one user prompt to completion, streaming content deltas via
@@ -878,7 +935,19 @@ where
     F: Fn(serde_json::Value) -> Fut,
     Fut: Future<Output = serde_json::Value> + Send,
 {
-    state.history.push(ChatMessage::user(req.text_content()));
+    // History image policy (council): strip image parts from PRIOR turns' user
+    // messages down to a text placeholder, so base64 images aren't re-sent (and
+    // re-billed) every turn. The CURRENT turn's images are added just below and
+    // stay intact for this turn's request.
+    strip_history_images(&mut state.history);
+
+    // Build the user message, routing image content for vision-capable models
+    // (image input, Phase 2). Text-only turns are byte-identical to before.
+    let (user_text, images) = req.content_parts();
+    let vision = crate::vision::model_supports_vision(client.model());
+    state
+        .history
+        .push(build_user_message(user_text, images, vision, client.model()));
 
     let mut mcp_connection_id: Option<String> = None;
     let mut tool_round: usize = 0;
@@ -1787,7 +1856,7 @@ where
             && effective_tool_tier == ToolTier::Emulated
             && !tool_names.is_empty()
         {
-            if let Some(content) = result.final_message.content.as_deref() {
+            if let Some(content) = result.final_message.content_text() {
                 if let Some(synth) =
                     emulated_parser::try_extract_tool_call(content, &tool_names)
                 {
@@ -1969,8 +2038,7 @@ where
             // when it only reasoned), independent of the UI bleed-buffer.
             let no_answer = result
                 .final_message
-                .content
-                .as_deref()
+                .content_text()
                 .map(|c| c.trim().is_empty())
                 .unwrap_or(true);
             let hit_token_limit =
@@ -1999,7 +2067,8 @@ where
                 if let Some(last) = state.history.last_mut() {
                     last.content = Some(
                         "I wasn't able to produce an answer (reasoning budget exhausted)."
-                            .to_string(),
+                            .to_string()
+                            .into(),
                     );
                 }
                 let kind = crate::acp::messages::finish_reason_to_prompt_error_kind(
@@ -2295,6 +2364,77 @@ where
 mod tests {
     use super::*;
 
+    // --- Phase 2: image-input prompt gate ---
+
+    fn img(mime: &str, data: &str) -> crate::acp::messages::ImageInput {
+        crate::acp::messages::ImageInput {
+            mime: mime.into(),
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn build_user_message_text_only_is_a_plain_string() {
+        let m = build_user_message("hi".into(), vec![], true, "qwen2.5-vl");
+        assert_eq!(m.content_text(), Some("hi"));
+        assert!(matches!(
+            m.content,
+            Some(crate::openai::messages::MessageContent::Text(_))
+        ));
+    }
+
+    #[test]
+    fn build_user_message_vision_model_forwards_images() {
+        let m = build_user_message(
+            "what is this?".into(),
+            vec![img("image/png", "AAAA")],
+            true,
+            "qwen2.5-vl",
+        );
+        let v = serde_json::to_value(&m).unwrap();
+        let arr = v["content"].as_array().expect("multimodal content array");
+        assert!(arr.iter().any(|p| p["type"] == "image_url"
+            && p["image_url"]["url"] == "data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn build_user_message_text_only_model_degrades_with_visible_note() {
+        let m = build_user_message(
+            "look".into(),
+            vec![img("image/png", "AAAA")],
+            false,
+            "qwen3:14b",
+        );
+        // Degrades to a plain string (no image_url) with a visible omission note.
+        assert!(matches!(
+            m.content,
+            Some(crate::openai::messages::MessageContent::Text(_))
+        ));
+        let t = m.content_text().unwrap();
+        assert!(t.starts_with("look"));
+        assert!(
+            t.contains("image attachment(s) omitted"),
+            "must surface the omission, got: {t}"
+        );
+    }
+
+    #[test]
+    fn strip_history_images_downgrades_prior_image_turns() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user_multimodal("earlier".into(), vec![("image/png".into(), "AA".into())]),
+        ];
+        strip_history_images(&mut history);
+        // The prior multimodal user turn is now plain text (no base64 to re-send).
+        assert!(matches!(
+            history[1].content,
+            Some(crate::openai::messages::MessageContent::Text(_))
+        ));
+        let v = serde_json::to_value(&history[1]).unwrap();
+        assert!(v["content"].is_string(), "re-sent turn must be text, got {v}");
+        assert!(history[1].content_text().unwrap().contains("earlier"));
+    }
+
     #[test]
     fn tool_ceiling_truncates_tail_only_when_exceeded_on_a_tool_tier() {
         let mk = |n: u32| Some((0..n).collect::<Vec<u32>>());
@@ -2541,7 +2681,7 @@ mod tests {
         let _dropped = prune_history_atomic(&mut h, 50);
         // The last surviving user message must be the "latest" one.
         let last_user = h.iter().rev().find(|m| matches!(m.role, Role::User)).unwrap();
-        let content = last_user.content.as_deref().unwrap_or("");
+        let content = last_user.content_text().unwrap_or("");
         assert!(
             content.contains("latest"),
             "latest user must survive; surviving user content was {content:?}"
@@ -2637,7 +2777,7 @@ mod tests {
                 "h[{i}] expected role=System, got {:?}",
                 h[i].role
             );
-            assert_eq!(h[i].content.as_deref(), Some(*expected_text));
+            assert_eq!(h[i].content_text(), Some(*expected_text));
         }
         // Latest user must still be present at the end.
         assert!(matches!(h.last().unwrap().role, Role::User));
@@ -2664,7 +2804,7 @@ mod tests {
         let _dropped = prune_history_atomic(&mut h, target);
         // Latest user always survives.
         assert_eq!(
-            h.last().unwrap().content.as_deref(),
+            h.last().unwrap().content_text(),
             Some("latest"),
             "latest user must always survive"
         );
@@ -2672,7 +2812,7 @@ mod tests {
         // (i.e. turn1 dropped first). Check that no turn1 content
         // remains.
         for msg in &h {
-            let content = msg.content.as_deref().unwrap_or("");
+            let content = msg.content_text().unwrap_or("");
             assert!(
                 !content.starts_with("turn1_"),
                 "turn1 must be dropped before turn3; found {content:?}"
@@ -3055,7 +3195,7 @@ mod tests {
         assert_eq!(last.tool_call_id.as_deref(), Some("call_c"));
         // Content shape includes isError:true so backends treat it as
         // a failure response, not a phantom success.
-        let content = last.content.as_deref().unwrap_or("");
+        let content = last.content_text().unwrap_or("");
         assert!(
             content.contains("circuit breaker"),
             "stub message should mention the breaker; got {content:?}"
@@ -3145,7 +3285,7 @@ mod tests {
         }
         // The caller's reason — NOT the hardcoded breaker phrasing — is surfaced.
         let last = history.last().unwrap();
-        let content = last.content.as_deref().unwrap_or("");
+        let content = last.content_text().unwrap_or("");
         assert!(
             content.contains("malformed schema output"),
             "stub must use the caller's reason, got {content:?}"

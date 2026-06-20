@@ -2579,7 +2579,7 @@ mod tests {
             .await
             .expect("no deadline must let the reply complete");
         assert_eq!(result.finish_reason, "stop");
-        assert_eq!(result.final_message.content.as_deref(), Some("done"));
+        assert_eq!(result.final_message.content_text(), Some("done"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2688,7 +2688,7 @@ mod tests {
             .await
             .expect("a paced stream (each gap < the cap) must complete — the deadline re-arms");
         assert_eq!(result.finish_reason, "stop");
-        assert_eq!(result.final_message.content.as_deref(), Some("hi there"));
+        assert_eq!(result.final_message.content_text(), Some("hi there"));
         server.abort();
     }
 
@@ -2883,7 +2883,7 @@ mod tests {
             .await
             .expect("the retry must reach the responsive backend");
         assert_eq!(result.finish_reason, "stop");
-        assert_eq!(result.final_message.content.as_deref(), Some("hi"));
+        assert_eq!(result.final_message.content_text(), Some("hi"));
         assert!(
             n.load(Ordering::SeqCst) >= 2,
             "the stalled first attempt must have been retried"
@@ -3072,7 +3072,7 @@ mod tests {
             .await
             .expect("cap=0 must not arm a timeout on a slow-but-healthy backend");
         assert_eq!(result.finish_reason, "stop");
-        assert_eq!(result.final_message.content.as_deref(), Some("ok"));
+        assert_eq!(result.final_message.content_text(), Some("ok"));
         server.abort();
     }
 
@@ -3299,7 +3299,7 @@ mod tests {
             .await
             .expect("stream completes");
         assert_eq!(
-            result.final_message.content.as_deref(),
+            result.final_message.content_text(),
             Some("The door is open."),
             "the <think> chain-of-thought must be stripped from the answer"
         );
@@ -3340,7 +3340,7 @@ mod tests {
             .await
             .expect("a stream that closes without [DONE] must still complete");
         assert_eq!(result.finish_reason, "stop");
-        assert_eq!(result.final_message.content.as_deref(), Some("hello"));
+        assert_eq!(result.final_message.content_text(), Some("hello"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
