@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 nwiro UE5 plugin. This file is the human-readable release summary; for the full
 per-version trail see the git history.
 
+## [0.4.0] — 2026-06-21
+
+Image input support, plus ACP-contract and release-pipeline hardening. The shim now forwards
+images to vision-capable local models (and degrades cleanly otherwise), Intel macOS is back as a
+release target, and the release pipeline publishes all platforms atomically.
+
+### Added
+- **Image content input**: `session/prompt` image blocks are forwarded to vision-capable local
+  models as OpenAI image content; non-vision models degrade cleanly to a text placeholder.
+  `promptCapabilities` now advertises image support per the ACP spec.
+- **Intel macOS binary** (`x86_64-apple-darwin`), cross-compiled on the `macos-14` runner — Intel
+  Macs (macOS 11+) now get a matching release asset alongside Apple Silicon.
+- **`SHA256SUMS`** attached to every release for artifact-integrity verification.
+- **macOS in CI**: the build + test + golden suite now also runs natively on `macos-14`.
+
+### Changed
+- **Atomic releases**: the release workflow assembles all platform binaries and publishes them in
+  one shot — a single failed target can no longer leave a partial release. Releases are also gated
+  to tags that are on `main`.
+- **`session/set_mode` honesty**: the shim ACKs the default/`auto` mode (it offers no real modes)
+  but now rejects any other requested mode with `-32602` instead of falsely ACKing a no-op switch.
+
+### Fixed
+- **MCP id correlation**: outbound `mcp/*` replies now correlate on a JSON number **or** a numeric
+  string, so a host bridge that stringifies the echoed id no longer orphans the request into a 30 s
+  tool-round-trip timeout.
+
 ## [0.3.0] — 2026-06-16
 
 Prompt-path resilience hardening: three layered timeout guards (inactivity, pre-stream,
