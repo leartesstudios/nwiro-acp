@@ -432,24 +432,22 @@ pub fn kind_to_user_message(kind: &str) -> &'static str {
 
 /// A single content block in a `session/prompt` payload.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptBlock {
-    // TODO: route on block kind when mixed-content (text + image) prompts
-    // become a real shim concern. Currently `text_content()` filters to
-    // text-only and image blocks are silently dropped.
+    // `kind` (ACP "type": text|image|resource|resource_link) is retained for
+    // wire fidelity; routing is by field presence (`data` ⇒ image) in
+    // `content_parts()`, so `kind` itself stays read-only.
     #[allow(dead_code)]
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// Base64-encoded image data.
-    // TODO: image-content support for vision-capable local LLMs (Qwen2-VL,
-    // LLaVA, etc.). Requires OpenAI multimodal content-array shape.
-    #[allow(dead_code)]
+    /// Base64-encoded image data (ACP `image` content block). Rendered into an
+    /// OpenAI `image_url` data-URL by `content_parts()` for vision-capable models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
-    // TODO: image-content support for vision-capable local LLMs (pairs
-    // with `data` above).
-    #[allow(dead_code)]
+    /// MIME type for `data` (e.g. `image/png`, `image/jpeg`). Defaults to
+    /// `image/png` in `content_parts()` when the bridge omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
@@ -465,17 +463,50 @@ pub struct SessionPromptParams {
     pub tools: Option<Vec<serde_json::Value>>,
 }
 
+/// One image extracted from an ACP prompt block, ready to render into an OpenAI
+/// `image_url` content part.
+#[derive(Debug, Clone)]
+pub struct ImageInput {
+    pub mime: String,
+    /// Base64-encoded image payload (no `data:` prefix).
+    pub data: String,
+}
+
 impl SessionPromptParams {
-    /// Concatenate all `text`-type prompt blocks into a single string for the
-    /// `role: user` content slot of an OpenAI chat message. Image blocks are
-    /// dropped here — image content support is a Phase 3 follow-up that
-    /// would map to OpenAI's vision-capable model content schema.
+    /// Concatenate all `text` prompt blocks into a single string for the
+    /// `role: user` content slot. (Image blocks contribute nothing here — use
+    /// `content_parts()` to get text + images together.)
     pub fn text_content(&self) -> String {
         self.prompt
             .iter()
             .filter_map(|b| b.text.as_ref().cloned())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Split the prompt into the joined text and the list of image inputs
+    /// (blocks carrying base64 `data`). The prompt-build sites use this to
+    /// construct a multimodal user message for vision-capable models, or to
+    /// append an omission note for text-only models.
+    pub fn content_parts(&self) -> (String, Vec<ImageInput>) {
+        let images = self
+            .prompt
+            .iter()
+            .filter_map(|b| {
+                let data = b.data.as_ref()?;
+                if data.is_empty() {
+                    return None;
+                }
+                Some(ImageInput {
+                    mime: b
+                        .mime_type
+                        .clone()
+                        .unwrap_or_else(|| "image/png".to_string()),
+                    data: data.clone(),
+                })
+            })
+            .collect();
+        (self.text_content(), images)
     }
 }
 
@@ -695,6 +726,48 @@ pub fn map_finish_reason_to_acp_stop_reason(finish_reason: &str) -> &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Phase 2: image content parts ---
+
+    #[test]
+    fn content_parts_splits_text_and_images_with_camelcase_mime() {
+        let p: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "describe"},
+                {"type": "image", "data": "BASE64", "mimeType": "image/jpeg"}
+            ]
+        }))
+        .unwrap();
+        let (text, images) = p.content_parts();
+        assert_eq!(text, "describe");
+        assert_eq!(images.len(), 1);
+        // Regression: the ACP wire sends `mimeType` (camelCase); PromptBlock must
+        // deserialise it into `mime_type`. (Pre-fix this was None → "image/png".)
+        assert_eq!(images[0].mime, "image/jpeg");
+        assert_eq!(images[0].data, "BASE64");
+    }
+
+    #[test]
+    fn content_parts_text_only_yields_no_images() {
+        let p: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}]
+        }))
+        .unwrap();
+        let (text, images) = p.content_parts();
+        assert_eq!(text, "hi");
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn image_block_mime_defaults_to_png_when_omitted() {
+        let p: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "s1", "prompt": [{"type": "image", "data": "X"}]
+        }))
+        .unwrap();
+        let (_t, images) = p.content_parts();
+        assert_eq!(images[0].mime, "image/png");
+    }
 
     // v0.1.24 G2 round-2 (post-review) — verify the OpenAI →
     // ACP stopReason mapping. The bridge consumes stopReason via

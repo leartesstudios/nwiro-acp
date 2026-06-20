@@ -45,6 +45,10 @@ pub struct ConnectorConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ConnectorPrompt {
     pub text: String,
+    /// Image inputs extracted from the ACP prompt blocks (Phase 2 image input).
+    /// Empty for text-only prompts; rendered to OpenAI `image_url` parts
+    /// downstream when the target model is vision-capable.
+    pub images: Vec<crate::acp::messages::ImageInput>,
     pub tools: Option<serde_json::Value>,
 }
 

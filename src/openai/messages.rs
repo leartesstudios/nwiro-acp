@@ -9,10 +9,81 @@ pub enum Role {
     Tool,
 }
 
+/// OpenAI chat-message content: either a plain string (the overwhelmingly common
+/// case, byte-identical to the pre-multimodal wire) or an array of typed parts
+/// (text + image_url) for vision-capable models. `#[serde(untagged)]` means a
+/// `Text` serialises as a bare JSON string — so text-only turns are unchanged on
+/// the wire and every golden transcript is preserved.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// One part of a multimodal `content` array. Serialises as
+/// `{"type":"text","text":...}` or `{"type":"image_url","image_url":{"url":...}}`
+/// — the OpenAI `/v1/chat/completions` multimodal shape accepted by Ollama,
+/// LM Studio, llama.cpp, and vLLM.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ImageUrl {
+    /// A `data:<mime>;base64,<payload>` URL (the portable form all four local
+    /// runtimes accept) or a plain http(s) URL.
+    pub url: String,
+}
+
+impl MessageContent {
+    /// The textual view of this content: the string for `Text`, or the first
+    /// text part for `Parts`. Used by the call sites that read a message's
+    /// content as plain text (circuit-breaker signatures, history inspection,
+    /// no-answer detection). Image parts are intentionally not rendered here.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            MessageContent::Text(s) => Some(s.as_str()),
+            MessageContent::Parts(parts) => parts.iter().find_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::ImageUrl { .. } => None,
+            }),
+        }
+    }
+
+    /// Mutable access to the backing string when this is plain-text content
+    /// (used by the system-directive merge, which only targets the system
+    /// message — always `Text`). Returns `None` for a multimodal `Parts`.
+    pub fn as_text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            MessageContent::Text(s) => Some(s),
+            MessageContent::Parts(_) => None,
+        }
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        MessageContent::Text(s)
+    }
+}
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        MessageContent::Text(s.to_string())
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: Option<String>,
+    // NOTE: intentionally NOT `skip_serializing_if` — an assistant tool-call-only
+    // message serialises `"content":null`, which backends expect and the golden
+    // transcripts pin. `MessageContent::Text` serialises as a bare string, so
+    // text-only turns are byte-identical to the pre-multimodal wire.
+    pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,7 +98,7 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -36,7 +107,32 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Construct a role=user message carrying text PLUS one or more images, in
+    /// the OpenAI multimodal `content`-array shape. Each image is `(mime, base64)`
+    /// and is emitted as `{type:"image_url", image_url:{url:"data:<mime>;base64,<b64>"}}`.
+    /// Used only when the target model is vision-capable; callers gate on that.
+    /// The leading text part is included only when non-empty.
+    pub fn user_multimodal(text: String, images: Vec<(String, String)>) -> Self {
+        let mut parts: Vec<ContentPart> = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        for (mime, data) in images {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:{mime};base64,{data}"),
+                },
+            });
+        }
+        Self {
+            role: Role::User,
+            content: Some(MessageContent::Parts(parts)),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -45,10 +141,18 @@ impl ChatMessage {
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
         Self {
             role: Role::Assistant,
-            content,
+            content: content.map(MessageContent::Text),
             tool_calls,
             tool_call_id: None,
         }
+    }
+
+    /// Plain-text view of this message's content, regardless of whether it is a
+    /// `Text` string or a multimodal `Parts` array (returns the first text part).
+    /// Replaces the former `self.content.as_deref()` now that content can be
+    /// multimodal. Image parts are not rendered.
+    pub fn content_text(&self) -> Option<&str> {
+        self.content.as_ref().and_then(|c| c.as_text())
     }
 
     /// Construct a role=tool message. The model needs the tool's *result text*,
@@ -60,7 +164,7 @@ impl ChatMessage {
     pub fn tool(tool_call_id: impl Into<String>, content: serde_json::Value) -> Self {
         Self {
             role: Role::Tool,
-            content: Some(mcp_result_to_text(&content)),
+            content: Some(MessageContent::Text(mcp_result_to_text(&content))),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
@@ -370,5 +474,61 @@ mod tests {
         let parsed: StreamingResponse =
             serde_json::from_str(chunk).expect("normal chunk must deserialize");
         assert!(parsed.error.is_none());
+    }
+
+    // --- Phase 2: multimodal content (images) ---
+
+    #[test]
+    fn user_text_serialises_as_a_bare_string() {
+        // Wire back-compat: a plain text user message MUST stay a bare JSON
+        // string (this is what keeps every text-only golden byte-identical).
+        let v = serde_json::to_value(ChatMessage::user("hello")).unwrap();
+        assert_eq!(v["content"], json!("hello"));
+        assert!(v["content"].is_string());
+    }
+
+    #[test]
+    fn user_multimodal_serialises_the_openai_content_array() {
+        let v = serde_json::to_value(ChatMessage::user_multimodal(
+            "what is this?".to_string(),
+            vec![("image/png".to_string(), "AAAA".to_string())],
+        ))
+        .unwrap();
+        let arr = v["content"].as_array().expect("multimodal content is an array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(
+            arr[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+        );
+    }
+
+    #[test]
+    fn user_multimodal_with_empty_text_omits_the_text_part() {
+        let v = serde_json::to_value(ChatMessage::user_multimodal(
+            String::new(),
+            vec![("image/jpeg".to_string(), "ZZ".to_string())],
+        ))
+        .unwrap();
+        let arr = v["content"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "no leading empty text part");
+        assert_eq!(arr[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn assistant_tool_only_message_keeps_content_null() {
+        // Regression: an assistant tool-call-only message serialises
+        // `"content":null` (pinned by the goldens, expected by backends).
+        let v = serde_json::to_value(ChatMessage::assistant(None, Some(vec![]))).unwrap();
+        assert!(v.get("content").is_some_and(|c| c.is_null()), "got {v}");
+    }
+
+    #[test]
+    fn content_text_reads_the_text_of_a_multimodal_message() {
+        let m = ChatMessage::user_multimodal(
+            "caption".to_string(),
+            vec![("image/jpeg".to_string(), "x".to_string())],
+        );
+        assert_eq!(m.content_text(), Some("caption"));
     }
 }

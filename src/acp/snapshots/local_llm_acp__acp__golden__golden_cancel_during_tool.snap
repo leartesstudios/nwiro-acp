@@ -7,17 +7,25 @@ expression: normalize(capture.frames())
     "id": 1,
     "jsonrpc": "2.0",
     "result": {
-      "serverCapabilities": {
+      "agentCapabilities": {
+        "loadSession": false,
+        "promptCapabilities": {
+          "audio": false,
+          "embeddedContext": false,
+          "image": false
+        },
         "session": {
           "cancel": true,
           "prompt": true,
           "setConfigOption": true
         }
       },
-      "serverInfo": {
+      "agentInfo": {
         "name": "local-llm-acp",
         "version": "[version]"
-      }
+      },
+      "authMethods": [],
+      "protocolVersion": 1
     }
   },
   {
