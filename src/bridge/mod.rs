@@ -972,6 +972,28 @@ where
         })
         .unwrap_or_default();
 
+    // v0.4.1: schema lookup for shim-side argument coercion — tool name →
+    // that tool's `function.parameters` JSON Schema. Built once per prompt
+    // from the UNTRIMMED `req.tools` (the family/learned ceilings trim only
+    // the OUTBOUND array; any name the model emits should still coerce),
+    // mirroring the `tool_names` extraction above. A tool entry without
+    // `parameters` simply never coerces. Duplicate tool names last-wins —
+    // fine, registry names are unique.
+    let tool_schemas: std::collections::HashMap<String, serde_json::Value> = req
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    let name = t.pointer("/function/name")?.as_str()?.to_string();
+                    let schema = t.pointer("/function/parameters")?.clone();
+                    Some((name, schema))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // v0.1.22 Fix D + G1 setup: read thresholds + max-tool-rounds from
     // env, with sane defaults. Done once per prompt, not per iteration.
     //
@@ -2144,6 +2166,7 @@ where
             let tio_started = std::time::Instant::now();
             let response_value = match tools::execute_tool(
                 call,
+                tool_schemas.get(&call.function.name),
                 &mut mcp_connection_id,
                 &write_mcp_request,
             )

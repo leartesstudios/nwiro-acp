@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 nwiro UE5 plugin. This file is the human-readable release summary; for the full
 per-version trail see the git history.
 
+## [Unreleased]
+
+### Fixed
+- **Schema-aware coercion of stringified tool arguments**: local models frequently
+  double-encode a structured parameter as a JSON *string* (e.g. `add_variables:
+  "[{\"name\":\"IsActive\",\"type\":\"bool\"}]"`), which the host bridge's typed field
+  reader then type-fails, silently skipping the operation. The shim now parses such a
+  string and dispatches the real value — but ONLY when the tool's inputSchema declares
+  that property as exactly one non-string JSON type (`array`/`object`/`boolean`/
+  `number`/`integer`). String-typed, union-typed (`type: [..]`), `oneOf`/`anyOf`, and
+  schema-less properties are never touched, and a string that fails to parse (or parses
+  to a non-matching type) dispatches verbatim — the host plugin owns
+  validation/rejection. Each coercion is logged (tool + field names, never values).
+  Known limitation: union-typed (`oneOf`/`anyOf`) properties are deliberately never
+  coerced.
+
 ## [0.3.0] — 2026-06-16
 
 Prompt-path resilience hardening: three layered timeout guards (inactivity, pre-stream,
