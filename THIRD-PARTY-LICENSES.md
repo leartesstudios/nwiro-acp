@@ -14,7 +14,7 @@ cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
 ## Apache License 2.0
 
 Crates distributed under this license:
-- local-llm-acp 0.4.0
+- local-llm-acp 0.5.0
 
 ```
                                  Apache License
