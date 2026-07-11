@@ -8,7 +8,7 @@ expression: normalize(capture.frames())
     "jsonrpc": "2.0",
     "result": {
       "agentCapabilities": {
-        "loadSession": false,
+        "loadSession": true,
         "promptCapabilities": {
           "audio": false,
           "embeddedContext": false,

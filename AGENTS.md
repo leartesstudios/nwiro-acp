@@ -35,6 +35,10 @@ reflected in `CHANGELOG.md`.
   non-string JSON type (`array`/`object`/`boolean`/`number`/`integer`). Never loosen it
   to touch string-typed, union-typed (`type: [..]`, `oneOf`/`anyOf`), or schema-less
   properties — the host plugin owns validation and rejection.
+- **Persisted-session envelope is a versioned contract** (`schema_version` in
+  `src/persist.rs`): breaking its shape requires a version bump, and older files must
+  fail `session/load` with `-32002` (the host silently falls back to `session/new`) —
+  never a crash or a partial load.
 
 ## Scope boundary
 

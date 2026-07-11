@@ -280,6 +280,12 @@ pub struct SessionState {
     /// (not global) because n_ctx is a property of the loaded model and
     /// sessions can switch models.
     pub learned_tool_ceiling: Option<usize>,
+    /// Session-persistence anchor (targets v0.5.0): the resolved storage dir
+    /// (derived from the `session/new` cwd or the `NWIRO_SHIM_STATE_DIR`
+    /// override) plus the session's original `created_at`. `None` = this
+    /// session is never written to disk (kill switch off, no/invalid cwd, or
+    /// the connector path). See `src/persist.rs` for the envelope contract.
+    pub persist: Option<crate::persist::PersistHandle>,
 }
 
 /// Estimate token count for the full outbound payload (messages + tools).
@@ -2181,7 +2187,12 @@ where
                     }],
                     "isError": true
                 }),
+                // UnknownSession is minted only at the prompt-entry session
+                // lookup — `execute_tool` can never construct it — but the
+                // no-wildcard policy demands an explicit bucket: fatal, like
+                // the other infrastructure failures.
                 Err(e @ ShimError::AcpFraming(_))
+                | Err(e @ ShimError::UnknownSession(_))
                 | Err(e @ ShimError::OpenAiHttp(_))
                 | Err(e @ ShimError::Config(_)) => return Err(e),
             };

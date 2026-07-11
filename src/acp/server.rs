@@ -11,8 +11,9 @@ use crate::{
     acp::{
         frame,
         messages::{
-            InitializeParams, SessionCancelParams, SessionNewParams, SessionPromptParams,
-            SessionUpdateNotification, SetConfigOptionParams, ToolTier, WarmupParams,
+            InitializeParams, SessionCancelParams, SessionLoadParams, SessionNewParams,
+            SessionPromptParams, SessionUpdateNotification, SetConfigOptionParams, ToolTier,
+            WarmupParams,
         },
     },
     bridge,
@@ -399,7 +400,7 @@ pub struct Server {
     /// `Arc` without lock contention.
     next_shim_id: Arc<AtomicU64>,
     /// v0.1.18 STREAM-002: side-map of session_id → CancellationToken,
-    /// populated by `handle_session_new` and drained by
+    /// populated by `handle_session_new` and re-armed (fresh token) by
     /// `handle_session_cancel`. The frame-router task uses this map
     /// to fire `token.cancel()` IMMEDIATELY on receiving a
     /// `session/cancel` frame, bypassing the dispatcher's serialized
@@ -418,8 +419,9 @@ pub struct Server {
     /// `CancellationToken::cancel()` is idempotent (sets an atomic
     /// flag), so the double-cancel from the fast-path AND the
     /// later dispatcher-path `handle_session_cancel` is harmless.
-    /// The dispatcher path still runs to clean up the sessions
-    /// HashMap and drain `pending_requests`.
+    /// The dispatcher path still runs to re-arm the session with a
+    /// fresh token and drain `pending_requests` (cancel is
+    /// turn-scoped — the session itself survives).
     cancel_tokens: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Sink for every outbound ACP frame. Production is `frame::StdoutSink`,
     /// which forwards verbatim to `frame::write_frame` (byte-identical to the
@@ -559,8 +561,8 @@ impl Server {
                 // CancellationToken IMMEDIATELY without waiting for
                 // the dispatcher to drain its serialized backlog.
                 // The dispatcher will still process the frame via
-                // bridge_tx below — that's where the sessions
-                // HashMap cleanup and pending_requests drain happen.
+                // bridge_tx below — that's where the token re-arm
+                // and pending_requests drain happen.
                 // CancellationToken::cancel() is idempotent so the
                 // double-fire is safe.
                 if msg.get("method").and_then(|m| m.as_str()) == Some("session/cancel") {
@@ -843,17 +845,44 @@ impl Server {
                             let sid = ConnectorSessionId::new(p.session_id);
                             // Trip the token (interrupt the turn), THEN tear the
                             // session down — removing it from the connector's
-                            // sessions map AND the shared cancel_tokens map — to
-                            // match legacy handle_session_cancel. Without the
-                            // teardown the cancelled token lingers (a re-prompt of
-                            // the same id would clone an already-cancelled token and
-                            // instantly cancel, corrupting history) and both maps
-                            // grow unbounded. The MCP-await unblock that legacy's
+                            // sessions map AND the shared cancel_tokens map.
+                            // NOTE: legacy handle_session_cancel is now
+                            // TURN-scoped (v0.4.0 — the session survives with a
+                            // re-armed token); this flag-gated non-default path
+                            // keeps the old teardown because a safe re-arm here
+                            // needs its own pass (per-turn state holds the
+                            // session mutex for the whole in-flight turn).
+                            // Without the teardown the cancelled token lingers
+                            // (a re-prompt of the same id would clone an
+                            // already-cancelled token and instantly cancel,
+                            // corrupting history) and both maps grow
+                            // unbounded. The MCP-await unblock that legacy's
                             // pending_requests drain would provide is Finding C
                             // (open on BOTH paths — the dispatcher is blocked, so
                             // neither path's drain runs mid-turn); not replicated.
                             let _ = conn.cancel(&sid).await;
                             let _ = conn.close_session(sid).await;
+                        }
+                        true
+                    }
+                    // Session persistence is a legacy-path feature: the
+                    // connector path answers session/load with -32002 (the
+                    // host classifies resource_not_found and silently falls
+                    // back to session/new). Deliberately NOT extended — the
+                    // connector keeps its own sessions map, so a legacy-side
+                    // restore would be invisible to it.
+                    "session/load" => {
+                        if let Some(req_id) = id.clone() {
+                            let sid = params
+                                .get("sessionId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let _ = output
+                                .write_frame(json!({
+                                    "jsonrpc":"2.0","id":req_id,
+                                    "error":{"code":-32002,"message":format!("session not found: {sid}")}
+                                }))
+                                .await;
                         }
                         true
                     }
@@ -888,6 +917,32 @@ impl Server {
                             "id": req_id,
                             "result": result,
                         });
+                        output.write_frame(response).await?;
+                    }
+                }
+
+                // Session persistence (targets v0.5.0): restore a persisted
+                // session across a shim restart. Contract: replay NOTHING (the
+                // result is an empty object; the host suppresses replayed
+                // chunks), and EVERY anomaly answers -32002 so the host
+                // classifies resource_not_found and silently falls back to
+                // session/new. Trivially inside the host's 30s load budget —
+                // it's one file read.
+                "session/load" => {
+                    let outcome = self.handle_session_load(params);
+                    if let Some(req_id) = id {
+                        let response = match outcome {
+                            Ok(result) => json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": result,
+                            }),
+                            Err(message) => json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": { "code": -32002, "message": message },
+                            }),
+                        };
                         output.write_frame(response).await?;
                     }
                 }
@@ -964,10 +1019,26 @@ impl Server {
                                 error = %e,
                                 "session/prompt failed; emitting -32000 and continuing"
                             );
+                            // Additive: unknown-session failures also carry
+                            // structured `error.data` so the client can
+                            // distinguish them from other -32000 errors
+                            // without parsing the message text (which stays
+                            // byte-identical, as does the code).
+                            let error_body = match &e {
+                                ShimError::UnknownSession(sid) => json!({
+                                    "code": -32000,
+                                    "message": e.to_string(),
+                                    "data": {
+                                        "reason": "unknown_session",
+                                        "sessionId": sid
+                                    }
+                                }),
+                                _ => json!({ "code": -32000, "message": e.to_string() }),
+                            };
                             let err = json!({
                                 "jsonrpc": "2.0",
                                 "id": req_id,
-                                "error": { "code": -32000, "message": e.to_string() }
+                                "error": error_body
                             });
                             // Best-effort: a write failure here (parent gone)
                             // must not abort the dispatcher loop either.
@@ -1072,7 +1143,12 @@ impl Server {
                 "version": env!("CARGO_PKG_VERSION")
             },
             "agentCapabilities": {
-                "loadSession": false,
+                // Session persistence (targets v0.5.0): the host only ever
+                // attempts a `session/load` resume when this is true. Gated on
+                // the NWIRO_SHIM_PERSIST kill switch (+ a sane
+                // NWIRO_SHIM_STATE_DIR override) so a disabled/broken storage
+                // config degrades to the host's plain session/new flow.
+                "loadSession": crate::persist::persistence_available(),
                 "promptCapabilities": {
                     "image": supports_vision,
                     "audio": false,
@@ -1091,6 +1167,21 @@ impl Server {
     fn handle_session_new(&mut self, params: serde_json::Value) -> Result<serde_json::Value> {
         let p: SessionNewParams = serde_json::from_value(params)
             .map_err(|e| ShimError::AcpFraming(format!("invalid session/new params: {e}")))?;
+
+        // Session persistence (targets v0.5.0): resolve the storage dir from
+        // the host-supplied cwd (or the NWIRO_SHIM_STATE_DIR override) ONCE at
+        // creation. `None` — kill switch off, absent/relative/nonexistent cwd —
+        // permanently disables persistence for this session (no writes; a
+        // restart cannot resume it). Validation happens here, not per-write.
+        let persist_handle = crate::persist::resolve_storage_dir(p.cwd.as_deref()).map(|dir| {
+            // First-use-per-process init: create the dir, clean stale *.tmp,
+            // run an eviction pass. Best-effort — never fails session/new.
+            crate::persist::init_storage_dir(&dir);
+            crate::persist::PersistHandle {
+                dir,
+                created_at: crate::persist::now_unix(),
+            }
+        });
 
         // Extract the bridge-supplied system prompt from `_meta.systemPrompt.append`.
         // NwiroIKBridge::DoCreateSession sets this for Claude and localllm; codex-acp
@@ -1134,6 +1225,7 @@ impl Server {
             // No context overflow learned yet this session — set on the
             // first overflow-recover (see bridge::handle_session_prompt).
             learned_tool_ceiling: None,
+            persist: persist_handle,
         };
         // Register the session's cancel_token in the side-map so the
         // frame-router's fast-path can fire it without waiting on the
@@ -1155,6 +1247,73 @@ impl Server {
         Ok(json!({ "sessionId": session_id }))
     }
 
+    /// `session/load` (targets v0.5.0): rebuild a persisted session from its
+    /// on-disk envelope under the SAME sessionId, with a fresh (untripped)
+    /// cancel token and no replay — the empty-object result IS the whole
+    /// restore signal. `Err(message)` maps to JSON-RPC `-32002` at the
+    /// dispatcher; the wire message is always the bland
+    /// `"session not found: <id>"` (the detailed reason goes to the trace log
+    /// only) because the host's fallback path doesn't read it and the storage
+    /// internals shouldn't leak.
+    fn handle_session_load(
+        &mut self,
+        params: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        // Fields are optional at parse time so malformed params degrade to the
+        // -32002 anomaly path below rather than a generic parse error.
+        let p: SessionLoadParams = serde_json::from_value(params).unwrap_or_default();
+        let requested = p.session_id.unwrap_or_default();
+        let not_found = |reason: &str| -> String {
+            tracing::warn!(
+                session_id = %requested_for_log(&requested),
+                reason,
+                "session/load failed — answering -32002 (host falls back to session/new)"
+            );
+            format!("session not found: {requested}")
+        };
+        fn requested_for_log(id: &str) -> &str {
+            if id.is_empty() { "(missing)" } else { id }
+        }
+
+        if requested.is_empty() {
+            return Err(not_found("missing/empty sessionId"));
+        }
+        if !crate::persist::persistence_available() {
+            return Err(not_found("persistence disabled (NWIRO_SHIM_PERSIST / state-dir config)"));
+        }
+        let Some(dir) = crate::persist::resolve_storage_dir(p.cwd.as_deref()) else {
+            return Err(not_found("invalid or missing cwd — no storage dir"));
+        };
+        // First-use-per-process init (stale-*.tmp cleanup + eviction pass).
+        // Best-effort; a load-only process still gets its storage hygiene.
+        crate::persist::init_storage_dir(&dir);
+        let envelope = crate::persist::load(&dir, &requested).map_err(|reason| not_found(&reason))?;
+
+        // Rebuild live state: persisted conversation state verbatim, fresh
+        // CancellationToken, non-durable flags re-defaulted. MCP state is not
+        // restored — it reconnects per normal turn flow.
+        let state = crate::persist::state_from_envelope(envelope, dir);
+
+        // Register the fresh cancel token in the frame-router's fast-path map,
+        // exactly like session/new does (and BEFORE the sessions insert, for
+        // the same defense-in-depth reason).
+        if let Ok(mut map) = self.cancel_tokens.lock() {
+            map.insert(requested.clone(), state.cancel_token.clone());
+        } else {
+            tracing::error!(
+                session_id = %requested,
+                "cancel_tokens lock poisoned — session/cancel fast-path will be \
+                 unavailable for this restored session"
+            );
+        }
+        self.sessions.insert(requested.clone(), state);
+
+        tracing::info!(session_id = %requested, "session restored from disk");
+        // REPLAY NOTHING: the host ignores load-result content and
+        // suppresses/forbids replayed chunks. An empty object is the contract.
+        Ok(json!({}))
+    }
+
     fn handle_set_config_option(&mut self, params: serde_json::Value) -> Result<serde_json::Value> {
         let p: SetConfigOptionParams = serde_json::from_value(params)
             .map_err(|e| ShimError::AcpFraming(format!("invalid set_config_option params: {e}")))?;
@@ -1173,6 +1332,11 @@ impl Server {
                 // the connector handler uses — they must not diverge (that was the
                 // incomplete-fix bug: this primary path stayed byte-exact).
                 state.tool_tier = resolve_set_config_tier(&warmed, &state.current_model);
+                // Session persistence: model + tool tier are durable session
+                // state — write through so a restart BEFORE the next turn
+                // still resumes with the right model/tier. Best-effort by
+                // contract: a failure logs and never fails this request.
+                crate::persist::save_session_state(state);
             }
         }
 
@@ -1264,7 +1428,10 @@ impl Server {
         let state = self
             .sessions
             .get_mut(&session_id)
-            .ok_or_else(|| ShimError::AcpFraming(format!("unknown session: {session_id}")))?;
+            // Dedicated variant (not AcpFraming) so the dispatcher's error
+            // response can carry structured `error.data.reason =
+            // "unknown_session"`; the wire message text is unchanged.
+            .ok_or_else(|| ShimError::UnknownSession(session_id.clone()))?;
         // v0.1.37 (Finding C): clone the session cancel token for the cancel-aware
         // MCP-await in `write_mcp_real` below. This is an immutable read through
         // `state` that completes before the `&mut state` reborrow at
@@ -1512,6 +1679,17 @@ impl Server {
         };
         let prompt_result = bridge::handle_session_prompt(req, state, &client, write_update, write_mcp_real).await;
 
+        // Session persistence: the turn is over and `state.history` is final
+        // for this turn — every return path of bridge::handle_session_prompt
+        // (clean finish, degrade, cancel) appends/repairs history before
+        // returning. Write the envelope through now (best-effort by contract:
+        // a failure logs and never fails the turn). Placed BEFORE the drainer
+        // join so the drainer-panic early return below cannot skip it; the
+        // `state` borrow ended with the call above, so this re-borrow is clean.
+        if let Some(state) = self.sessions.get(&session_id) {
+            crate::persist::save_session_state(state);
+        }
+
         // bridge::handle_session_prompt consumed `write_update` by
         // value; on return, the closure (and its captured update_tx
         // Sender) is dropped. That closes the mpsc channel.
@@ -1623,53 +1801,87 @@ impl Server {
         serde_json::to_value(result).unwrap_or_else(|_| json!({"status":"failed","elapsedMs":0,"errorKind":"unknown","message":"failed to serialise WarmupResult"}))
     }
 
+    /// TURN-scoped cancel (v0.4.0). `session/cancel` interrupts the in-flight
+    /// turn and clears only that turn's state — the session entry and its
+    /// in-memory conversation history SURVIVE, so a follow-up `session/prompt`
+    /// with the same sessionId keeps working. The host bridge treats cancel as
+    /// turn-scoped (it keeps its sessionId after a Stop/idle cancel); the
+    /// previous whole-session `sessions.remove` wedged every subsequent prompt
+    /// with an "unknown session" -32000. A cancel with no active turn (or for
+    /// an id we never knew) is a successful no-op.
     fn handle_session_cancel(&mut self, params: serde_json::Value) -> Result<()> {
         let p: SessionCancelParams = serde_json::from_value(params)
             .map_err(|e| ShimError::AcpFraming(format!("invalid session/cancel params: {e}")))?;
 
-        // Deregister from the fast-path map regardless of whether the
-        // session is still in self.sessions. If the frame-router
-        // already fast-path-cancelled this session, the token here is
-        // already in the cancelled state — calling cancel() again is
-        // idempotent.
-        if let Ok(mut map) = self.cancel_tokens.lock() {
-            map.remove(&p.session_id);
-        }
-
-        if let Some(state) = self.sessions.remove(&p.session_id) {
-            state.cancel_token.cancel();
-
-            // Drain in-flight shim→bridge requests owned by this
-            // session. Dropping each `PendingRequest` drops its
-            // `oneshot::Sender`, which makes the awaiting `Receiver`
-            // in `write_mcp_real` surface `RecvError` — the closure
-            // translates that to a `-32000` cancelled error rather
-            // than blocking until the 30s timeout fires.
-            //
-            // `retain` filters on `session_id` so cancellation of one
-            // session never disturbs another session's in-flight
-            // requests. O(in-flight), not O(total-sessions).
-            let drained = match self.pending_requests.lock() {
-                Ok(mut map) => {
-                    let before = map.len();
-                    map.retain(|_id, pending| pending.session_id != p.session_id);
-                    before - map.len()
-                }
-                Err(_) => {
-                    tracing::error!(
-                        session_id = %p.session_id,
-                        "pending_requests lock poisoned — cannot drain on cancel"
-                    );
-                    0
-                }
-            };
-
-            tracing::info!(
+        let Some(state) = self.sessions.get_mut(&p.session_id) else {
+            // Unknown session: successful no-op. Defensively drop any stray
+            // fast-path token entry so the map can't leak for ids that have
+            // no session state.
+            if let Ok(mut map) = self.cancel_tokens.lock() {
+                map.remove(&p.session_id);
+            }
+            tracing::debug!(
                 session_id = %p.session_id,
-                drained_requests = drained,
-                "session cancelled and removed"
+                "session/cancel for unknown session — no-op"
+            );
+            return Ok(());
+        };
+
+        // Trip the in-flight turn's token. The frame-router fast-path has
+        // usually fired this already (mid-turn cancels can only reach here
+        // after the turn ends, because the dispatcher is serialized);
+        // cancel() is idempotent, and this call covers the paths the
+        // fast-path can miss (poisoned lock, missing map entry). This is
+        // also what actually stops the backend HTTP generation —
+        // `chat_completion_stream` and the MCP awaits select on this token.
+        state.cancel_token.cancel();
+
+        // Re-arm: swap in a FRESH token for the session's next turn, in BOTH
+        // the session state and the frame-router's fast-path map. Without
+        // this the next prompt would clone the already-tripped token and be
+        // cancelled at birth.
+        let fresh = tokio_util::sync::CancellationToken::new();
+        state.cancel_token = fresh.clone();
+        if let Ok(mut map) = self.cancel_tokens.lock() {
+            map.insert(p.session_id.clone(), fresh);
+        } else {
+            tracing::error!(
+                session_id = %p.session_id,
+                "cancel_tokens lock poisoned — session/cancel fast-path will be \
+                 unavailable for this session's next turn"
             );
         }
+
+        // Drain in-flight shim→bridge requests owned by this
+        // session. Dropping each `PendingRequest` drops its
+        // `oneshot::Sender`, which makes the awaiting `Receiver`
+        // in `write_mcp_real` surface `RecvError` — the closure
+        // translates that to a `-32000` cancelled error rather
+        // than blocking until the 30s timeout fires.
+        //
+        // `retain` filters on `session_id` so cancellation of one
+        // session never disturbs another session's in-flight
+        // requests. O(in-flight), not O(total-sessions).
+        let drained = match self.pending_requests.lock() {
+            Ok(mut map) => {
+                let before = map.len();
+                map.retain(|_id, pending| pending.session_id != p.session_id);
+                before - map.len()
+            }
+            Err(_) => {
+                tracing::error!(
+                    session_id = %p.session_id,
+                    "pending_requests lock poisoned — cannot drain on cancel"
+                );
+                0
+            }
+        };
+
+        tracing::info!(
+            session_id = %p.session_id,
+            drained_requests = drained,
+            "turn cancelled — session retained"
+        );
 
         Ok(())
     }

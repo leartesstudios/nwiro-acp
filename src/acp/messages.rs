@@ -142,8 +142,10 @@ pub struct SessionMeta {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNewParams {
-    // TODO: forward to MCP servers when shim grows session-cwd routing.
-    #[allow(dead_code)]
+    /// Absolute UE project directory. Load-bearing since the session-persistence
+    /// work (targets v0.5.0): it anchors the on-disk session envelope at
+    /// `<cwd>/Saved/NwiroIntegrationKit/shim-sessions/` (see `src/persist.rs`).
+    /// Absent/relative/nonexistent → the session is simply not persisted.
     #[serde(default)]
     pub cwd: Option<String>,
     // NOTE: parsed for ACP spec compliance but intentionally ignored.
@@ -164,6 +166,29 @@ pub struct SessionNewParams {
     /// prepending for those, as it already does for Codex.
     #[serde(default, rename = "_meta")]
     pub meta: Option<SessionMeta>,
+}
+
+/// Params for `session/load` (bridge → shim): restore a persisted session.
+/// Mirrors `session/new`'s `cwd`/`mcpServers` surface plus the sessionId to
+/// resume. Every field is optional AT PARSE TIME so a malformed frame degrades
+/// to the handler's `-32002` anomaly path (which the host classifies as
+/// resource-not-found and silently falls back to `session/new`) instead of a
+/// generic parse error.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLoadParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Absolute UE project directory — locates the storage dir exactly like
+    /// `session/new.cwd` does (see `src/persist.rs`).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    // Parsed for spec compliance, intentionally ignored — same decision as
+    // `SessionNewParams.mcp_servers`: ALL MCP traffic routes via the bridge
+    // per turn, so there is no MCP state to persist or restore on load.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<serde_json::Value>>,
 }
 
 /// Params for `session/set_config_option` (bridge → shim).
