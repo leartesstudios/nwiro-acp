@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 nwiro UE5 plugin. This file is the human-readable release summary; for the full
 per-version trail see the git history.
 
-## [Unreleased]
+## [0.5.0] — 2026-07-11
 
 ### Fixed
 - **`session/cancel` destroyed the whole session**, wedging host chats with
@@ -42,49 +42,73 @@ per-version trail see the git history.
   additionally carries `error.data = {"reason": "unknown_session", "sessionId":
   "<id>"}`, so the host bridge can distinguish this case from other `-32000`
   errors without parsing the message string.
-
-<!-- ──────────────────────────────────────────────────────────────────────
-     RELEASE-SPLIT NOTE: the section below targets the NEXT MINOR (v0.5.0).
-     The Fixed/Added entries ABOVE ship as v0.4.1. Split at release time.
-     ────────────────────────────────────────────────────────────────────── -->
-
-### Added (unreleased — target v0.5.0: session persistence)
 - **Session persistence + `loadSession: true`**: the shim now persists each
   session's durable conversation state (history, per-session model, tool tier,
   learned tool ceiling, pruned-turn count) to one JSON envelope per session and
   advertises `agentCapabilities.loadSession: true` on `initialize`, so the host
   bridge can resume a prior conversation across a shim restart via ACP
   `session/load`.
-  - **Storage**: `<cwd>/Saved/NwiroIntegrationKit/shim-sessions/<encoded-session-id>.json`,
-    where `cwd` is the absolute project directory the host supplies on
-    `session/new` / `session/load`. Writes happen at turn end and on
-    model/tool-tier config changes, via an atomic same-directory temp-file +
-    rename (fsync best-effort); a write failure logs and never fails the turn.
-    Session ids are percent-encoded onto an `[A-Za-z0-9_-]` allowlist so a
-    hostile id cannot escape the storage directory.
-  - **`session/load` semantics**: restores state and returns an **empty object**
-    result — nothing is replayed (no `session/update` frames; the host
-    suppresses replayed chunks). The same sessionId is immediately live for
-    `session/prompt` with a fresh cancel token; MCP reconnects per normal turn
-    flow. ANY anomaly (unknown id, corrupt file, `schema_version` mismatch,
-    envelope/requested id mismatch, invalid cwd, persistence disabled) answers
-    JSON-RPC **`-32002` "session not found: \<id\>"**, which the host treats as
-    resource-not-found and silently falls back to `session/new`.
-  - **Kill switch**: `NWIRO_SHIM_PERSIST` (default ON; `0`/`false`/`off`
-    disables). Disabled ⇒ `loadSession: false` is advertised, nothing is
-    written, and `session/load` answers `-32002`.
-  - **`NWIRO_SHIM_STATE_DIR`** overrides the storage ROOT (it replaces
-    `<cwd>/Saved/NwiroIntegrationKit`; must be absolute). **Privacy warning:**
-    persisted history can contain project file contents and tool results —
-    pointing the override at a shared or synced directory moves that data
-    outside the project. The default location keeps it inside the project.
-  - **Eviction**: per storage dir, the newest ~50 session files are kept and
-    files older than ~30 days are deleted (after successful writes and at first
-    storage use per process); stale `*.tmp` leftovers are cleaned. Eviction
-    errors log and never block.
-  - The envelope is a versioned contract (`schema_version: 1`) — see the new
-    AGENTS.md invariant. The flag-gated connector path (non-default) does not
-    participate: its `session/load` answers `-32002`.
+- **Storage**: `<cwd>/Saved/NwiroIntegrationKit/shim-sessions/<encoded-session-id>.json`,
+  where `cwd` is the absolute project directory the host supplies on
+  `session/new` / `session/load`. Writes happen at turn end and on
+  model/tool-tier config changes, via an atomic same-directory temp-file +
+  rename (fsync best-effort); a write failure logs and never fails the turn.
+  Session ids are percent-encoded onto an `[A-Za-z0-9_-]` allowlist so a
+  hostile id cannot escape the storage directory.
+- **`session/load` semantics**: restores state and returns an **empty object**
+  result — nothing is replayed (no `session/update` frames; the host
+  suppresses replayed chunks). The same sessionId is immediately live for
+  `session/prompt` with a fresh cancel token; MCP reconnects per normal turn
+  flow. ANY anomaly (unknown id, corrupt file, `schema_version` mismatch,
+  envelope/requested id mismatch, invalid cwd, persistence disabled) answers
+  JSON-RPC **`-32002` "session not found: \<id\>"**, which the host treats as
+  resource-not-found and silently falls back to `session/new`.
+- **Kill switch**: `NWIRO_SHIM_PERSIST` (default ON; `0`/`false`/`off`
+  disables). Disabled ⇒ `loadSession: false` is advertised, nothing is
+  written, and `session/load` answers `-32002`.
+- **`NWIRO_SHIM_STATE_DIR`** overrides the storage ROOT (it replaces
+  `<cwd>/Saved/NwiroIntegrationKit`; must be absolute). **Privacy warning:**
+  persisted history can contain project file contents and tool results —
+  pointing the override at a shared or synced directory moves that data
+  outside the project. The default location keeps it inside the project.
+- **Eviction**: per storage dir, the newest ~50 session files are kept and
+  files older than ~30 days are deleted (after successful writes and at first
+  storage use per process); stale `*.tmp` leftovers are cleaned. Eviction
+  errors log and never block.
+- The envelope is a versioned contract (`schema_version: 1`) — see the new
+  AGENTS.md invariant. The flag-gated connector path (non-default) does not
+  participate: its `session/load` answers `-32002`.
+
+### Security
+- Bumped `anyhow` 1.0.102 → 1.0.103 (RUSTSEC-2026-0190, unsoundness in
+  `Error::downcast_mut`). Lockfile-only; no API change.
+
+## [0.4.0] — 2026-06-21
+
+Image input support, plus ACP-contract and release-pipeline hardening. The shim now forwards
+images to vision-capable local models (and degrades cleanly otherwise), Intel macOS is back as a
+release target, and the release pipeline publishes all platforms atomically.
+
+### Added
+- **Image content input**: `session/prompt` image blocks are forwarded to vision-capable local
+  models as OpenAI image content; non-vision models degrade cleanly to a text placeholder.
+  `promptCapabilities` now advertises image support per the ACP spec.
+- **Intel macOS binary** (`x86_64-apple-darwin`), cross-compiled on the `macos-14` runner — Intel
+  Macs (macOS 11+) now get a matching release asset alongside Apple Silicon.
+- **`SHA256SUMS`** attached to every release for artifact-integrity verification.
+- **macOS in CI**: the build + test + golden suite now also runs natively on `macos-14`.
+
+### Changed
+- **Atomic releases**: the release workflow assembles all platform binaries and publishes them in
+  one shot — a single failed target can no longer leave a partial release. Releases are also gated
+  to tags that are on `main`.
+- **`session/set_mode` honesty**: the shim ACKs the default/`auto` mode (it offers no real modes)
+  but now rejects any other requested mode with `-32602` instead of falsely ACKing a no-op switch.
+
+### Fixed
+- **MCP id correlation**: outbound `mcp/*` replies now correlate on a JSON number **or** a numeric
+  string, so a host bridge that stringifies the echoed id no longer orphans the request into a 30 s
+  tool-round-trip timeout.
 
 ## [0.3.0] — 2026-06-16
 
