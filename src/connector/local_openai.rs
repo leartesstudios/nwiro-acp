@@ -145,6 +145,10 @@ impl AgentRuntimeConnector for LocalOpenAiConnector {
                 token_budget_warned: false,
                 pruned_turn_count: 0,
                 learned_tool_ceiling: None,
+                // The connector path does not participate in session
+                // persistence (its session/load answers -32002; see the
+                // dispatcher). No storage dir → no writes.
+                persist: None,
             };
             self.cancel_tokens
                 .lock()

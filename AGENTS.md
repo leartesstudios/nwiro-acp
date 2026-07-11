@@ -30,6 +30,15 @@ reflected in `CHANGELOG.md`.
 - **Don't hand-edit golden snapshots** (`*.snap`); regenerate with `cargo insta review`.
 - **Public env-var ABI:** the `NWIRO_LOCAL_LLM_*` variables are a stable contract the
   host bridge consumes — don't rename them without a deliberate, versioned migration.
+- **Tool-arg coercion strict gate:** `coerce_args_to_schema` (`src/bridge/tools.rs`)
+  only ever coerces a stringified value whose schema property declares exactly ONE
+  non-string JSON type (`array`/`object`/`boolean`/`number`/`integer`). Never loosen it
+  to touch string-typed, union-typed (`type: [..]`, `oneOf`/`anyOf`), or schema-less
+  properties — the host plugin owns validation and rejection.
+- **Persisted-session envelope is a versioned contract** (`schema_version` in
+  `src/persist.rs`): breaking its shape requires a version bump, and older files must
+  fail `session/load` with `-32002` (the host silently falls back to `session/new`) —
+  never a crash or a partial load.
 
 ## Scope boundary
 

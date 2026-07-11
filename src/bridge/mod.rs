@@ -280,6 +280,12 @@ pub struct SessionState {
     /// (not global) because n_ctx is a property of the loaded model and
     /// sessions can switch models.
     pub learned_tool_ceiling: Option<usize>,
+    /// Session-persistence anchor (targets v0.5.0): the resolved storage dir
+    /// (derived from the `session/new` cwd or the `NWIRO_SHIM_STATE_DIR`
+    /// override) plus the session's original `created_at`. `None` = this
+    /// session is never written to disk (kill switch off, no/invalid cwd, or
+    /// the connector path). See `src/persist.rs` for the envelope contract.
+    pub persist: Option<crate::persist::PersistHandle>,
 }
 
 /// Estimate token count for the full outbound payload (messages + tools).
@@ -967,6 +973,28 @@ where
                     t.pointer("/function/name")
                         .and_then(|n| n.as_str())
                         .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // v0.4.1: schema lookup for shim-side argument coercion — tool name →
+    // that tool's `function.parameters` JSON Schema. Built once per prompt
+    // from the UNTRIMMED `req.tools` (the family/learned ceilings trim only
+    // the OUTBOUND array; any name the model emits should still coerce),
+    // mirroring the `tool_names` extraction above. A tool entry without
+    // `parameters` simply never coerces. Duplicate tool names last-wins —
+    // fine, registry names are unique.
+    let tool_schemas: std::collections::HashMap<String, serde_json::Value> = req
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    let name = t.pointer("/function/name")?.as_str()?.to_string();
+                    let schema = t.pointer("/function/parameters")?.clone();
+                    Some((name, schema))
                 })
                 .collect()
         })
@@ -2144,6 +2172,7 @@ where
             let tio_started = std::time::Instant::now();
             let response_value = match tools::execute_tool(
                 call,
+                tool_schemas.get(&call.function.name),
                 &mut mcp_connection_id,
                 &write_mcp_request,
             )
@@ -2158,7 +2187,12 @@ where
                     }],
                     "isError": true
                 }),
+                // UnknownSession is minted only at the prompt-entry session
+                // lookup — `execute_tool` can never construct it — but the
+                // no-wildcard policy demands an explicit bucket: fatal, like
+                // the other infrastructure failures.
                 Err(e @ ShimError::AcpFraming(_))
+                | Err(e @ ShimError::UnknownSession(_))
                 | Err(e @ ShimError::OpenAiHttp(_))
                 | Err(e @ ShimError::Config(_)) => return Err(e),
             };

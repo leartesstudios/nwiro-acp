@@ -14,7 +14,7 @@ cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
 ## Apache License 2.0
 
 Crates distributed under this license:
-- local-llm-acp 0.4.0
+- local-llm-acp 0.5.0
 
 ```
                                  Apache License
@@ -2130,7 +2130,7 @@ SOFTWARE.
 ## MIT License
 
 Crates distributed under this license:
-- anyhow 1.0.102
+- anyhow 1.0.103
 - atomic-waker 1.1.2
 - displaydoc 0.2.5
 - itoa 1.0.18

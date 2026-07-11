@@ -109,6 +109,10 @@ async fn drive_to_completion(inputs: &[&str]) -> Vec<serde_json::Value> {
 
 #[tokio::test]
 async fn golden_initialize() {
+    // Serialized: the snapshot pins `agentCapabilities.loadSession`, which the
+    // persistence kill-switch goldens flip via the process-global
+    // NWIRO_SHIM_PERSIST env var — running unserialised would race them.
+    let _serial = PROMPT_SERIAL.lock().await;
     let frames = drive_to_completion(&[
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     ])
@@ -3273,6 +3277,293 @@ async fn golden_cancel_during_tool() {
     insta::assert_json_snapshot!(normalize(capture.frames()));
 }
 
+/// Turn-scoped cancel: a `session/cancel` mid-turn must end ONLY the in-flight
+/// turn — the session and its conversation history survive, and a follow-up
+/// `session/prompt` with the SAME sessionId succeeds. The host bridge treats
+/// cancel as turn-scoped (it keeps its sessionId after a Stop/idle cancel), so
+/// destroying the session here wedged every subsequent prompt with an
+/// "unknown session" error.
+///
+/// History retention is asserted via what the mock backend RECEIVES (mock
+/// call-count asserts don't enforce in this harness): the round-3 mock only
+/// matches a request body that still carries the pre-cancel messages (turn 1's
+/// user text + assistant reply AND the cancelled turn 2's user text). If the
+/// cancel had wiped them, round 3 would fall through to a catch-all with a
+/// different reply text and the "session survived" assertion below fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_cancel_turn_scoped_session_survives() {
+    // LEGACY-PATH SPECIFIC: turn-scoped cancel semantics. The flag-gated
+    // connector path (LOCAL_LLM_USE_CONNECTOR=1, non-default) still tears the
+    // session down on cancel; skip cleanly there.
+    if std::env::var("LOCAL_LLM_USE_CONNECTOR").as_deref() == Ok("1") {
+        return;
+    }
+    // No tools -> no forced tier; serial for harness hygiene.
+    let _serial = PROMPT_SERIAL.lock().await;
+
+    let mut mock = mockito::Server::new_async().await;
+
+    // Round 3 (created FIRST so its specific matcher wins): matches ONLY when
+    // the request body still carries the full pre-cancel history — turn 1's
+    // user message AND its assistant reply AND the cancelled turn 2's user
+    // message — alongside turn 3's own user message.
+    let _r3 = mock
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::Regex("remember the codeword pineapple".to_string()),
+            mockito::Matcher::Regex("noted".to_string()),
+            mockito::Matcher::Regex("cancel me mid-stream".to_string()),
+            mockito::Matcher::Regex("are you still there".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse(&[
+            json!({"choices":[{"delta":{"content":"session survived"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]))
+        .create_async()
+        .await;
+
+    // Round 2: a long stream so the cancel lands mid-stream (same construction
+    // as golden_cancel_mid_stream — chat_completion_stream is cancel-aware).
+    let mut chunks: Vec<serde_json::Value> = (0..1000)
+        .map(|i| json!({"choices":[{"delta":{"content": format!("tok{i} ")}}]}))
+        .collect();
+    chunks.push(json!({"choices":[{"delta":{},"finish_reason":"stop"}]}));
+    let _r2 = mock
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::Regex("cancel me mid-stream".to_string()))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse(&chunks))
+        .create_async()
+        .await;
+
+    // Round 1 (catch-all, created LAST): the completed pre-cancel turn.
+    let _r1 = mock
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse(&[
+            json!({"choices":[{"delta":{"content":"noted"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]))
+        .create_async()
+        .await;
+
+    let capture = CaptureSink::new();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let client = openai::Client::new(mock.url(), "test-model".to_string(), None);
+    let server = Server::new_with_output(client, rx, Arc::new(capture.clone()));
+    let server_handle = tokio::spawn(server.run());
+
+    let sid = setup_session(&tx, &capture).await;
+
+    // Turn 1 completes normally — its user text + assistant reply become the
+    // pre-cancel conversation history.
+    send(
+        &tx,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/prompt",
+               "params":{"sessionId":sid,"prompt":[{"type":"text","text":"remember the codeword pineapple"}]}}),
+    );
+    wait_for(&capture, "turn 1 response", |f| is_response_to(f, 4)).await;
+
+    // Turn 2: cancel mid-stream, gated on the FIRST streamed token of THIS
+    // turn (turn 1 also emitted chunks, so discriminate on the "tok" text).
+    send(
+        &tx,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/prompt",
+               "params":{"sessionId":sid,"prompt":[{"type":"text","text":"cancel me mid-stream"}]}}),
+    );
+    wait_for(&capture, "turn 2 first streamed chunk", |f| {
+        f.pointer("/params/update/sessionUpdate").and_then(|v| v.as_str())
+            == Some("agent_message_chunk")
+            && f.pointer("/params/update/content/text")
+                .and_then(|v| v.as_str())
+                .map(|t| t.starts_with("tok"))
+                .unwrap_or(false)
+    })
+    .await;
+    send(
+        &tx,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}),
+    );
+    let resp2 = wait_for(&capture, "turn 2 response", |f| is_response_to(f, 5)).await;
+    assert_eq!(
+        resp2.pointer("/result/stopReason").and_then(|v| v.as_str()),
+        Some("cancelled"),
+        "cancel during streaming should yield stopReason:cancelled, got: {resp2}"
+    );
+
+    // Turn 3 on the SAME sessionId: the session must survive the cancel.
+    send(
+        &tx,
+        json!({"jsonrpc":"2.0","id":6,"method":"session/prompt",
+               "params":{"sessionId":sid,"prompt":[{"type":"text","text":"are you still there"}]}}),
+    );
+    let resp3 = wait_for(&capture, "turn 3 response", |f| is_response_to(f, 6)).await;
+    assert_eq!(
+        resp3.pointer("/result/stopReason").and_then(|v| v.as_str()),
+        Some("end_turn"),
+        "a follow-up prompt on the same sessionId must succeed after a \
+         turn-scoped cancel, got: {resp3}"
+    );
+    // The reply text proves the history-requiring round-3 matcher served this
+    // turn (all update frames precede the response frame, so no wait needed).
+    assert!(
+        capture.frames().iter().any(|f| {
+            f.pointer("/params/update/content/text").and_then(|v| v.as_str())
+                == Some("session survived")
+        }),
+        "turn 3 must be served by the mock that requires the pre-cancel \
+         history in the request body — history was lost across the cancel"
+    );
+
+    drop(tx);
+    tokio::time::timeout(std::time::Duration::from_secs(15), server_handle)
+        .await
+        .expect("server task did not join within 15s")
+        .expect("server task panicked")
+        .expect("server run returned error");
+}
+
+/// `session/cancel` with NO active turn is a successful no-op: no error, and
+/// the session stays usable (the next prompt on the same sessionId succeeds
+/// and is NOT instantly cancelled by a stale tripped token). The host bridge
+/// sends idle cancels (e.g. a Stop press after the turn already finished), so
+/// this must never invalidate the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_cancel_no_active_turn_noop() {
+    // LEGACY-PATH SPECIFIC: see golden_cancel_turn_scoped_session_survives.
+    if std::env::var("LOCAL_LLM_USE_CONNECTOR").as_deref() == Ok("1") {
+        return;
+    }
+    let _serial = PROMPT_SERIAL.lock().await;
+
+    let mut mock = mockito::Server::new_async().await;
+    let _m = mock
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse(&[
+            json!({"choices":[{"delta":{"content":"hi"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]))
+        .create_async()
+        .await;
+
+    let capture = CaptureSink::new();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let client = openai::Client::new(mock.url(), "test-model".to_string(), None);
+    let server = Server::new_with_output(client, rx, Arc::new(capture.clone()));
+    let server_handle = tokio::spawn(server.run());
+
+    let sid = setup_session(&tx, &capture).await;
+
+    // Idle cancel: no prompt is in flight.
+    send(
+        &tx,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}),
+    );
+
+    // The session must still be usable — and the prompt must actually run
+    // (end_turn), not be killed at birth by a stale tripped cancel token
+    // (which would surface as stopReason:cancelled).
+    send(
+        &tx,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/prompt",
+               "params":{"sessionId":sid,"prompt":[{"type":"text","text":"hello after idle cancel"}]}}),
+    );
+    let resp = wait_for(&capture, "post-cancel prompt response", |f| is_response_to(f, 4)).await;
+    assert_eq!(
+        resp.pointer("/result/stopReason").and_then(|v| v.as_str()),
+        Some("end_turn"),
+        "a prompt after an idle session/cancel must succeed, got: {resp}"
+    );
+    assert!(
+        !capture.frames().iter().any(|f| f.get("error").is_some()),
+        "an idle session/cancel must not produce any error frame; frames: {:#?}",
+        capture.frames()
+    );
+
+    drop(tx);
+    // The join chain also asserts run() returned Ok — an Err propagated out of
+    // the cancel handler would surface here.
+    tokio::time::timeout(std::time::Duration::from_secs(15), server_handle)
+        .await
+        .expect("server task did not join within 15s")
+        .expect("server task panicked")
+        .expect("server run returned error");
+}
+
+/// A `session/prompt` against an unknown sessionId keeps its wire shape (code
+/// -32000, message "ACP framing error: unknown session: <id>") and ADDITIONALLY
+/// carries structured `error.data` (`reason:"unknown_session"` + the offending
+/// sessionId) so the host bridge can distinguish this failure from other
+/// -32000 errors without parsing message text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_prompt_unknown_session_structured_error() {
+    // LEGACY-PATH SPECIFIC: the connector path answers pre-session prompts
+    // with its own -32602 (see connector_prompt_before_session_new_errors_not_hang).
+    if std::env::var("LOCAL_LLM_USE_CONNECTOR").as_deref() == Ok("1") {
+        return;
+    }
+    let _serial = PROMPT_SERIAL.lock().await;
+
+    // No backend call happens — the prompt fails at session lookup — so the
+    // client can point at an unroutable address.
+    let capture = CaptureSink::new();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let client = openai::Client::new(
+        "http://127.0.0.1:1/v1".to_string(),
+        "test-model".to_string(),
+        None,
+    );
+    let server = Server::new_with_output(client, rx, Arc::new(capture.clone()));
+    let server_handle = tokio::spawn(server.run());
+
+    send(&tx, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    wait_for(&capture, "initialize response", |f| is_response_to(f, 1)).await;
+
+    send(
+        &tx,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt",
+               "params":{"sessionId":"ghost-session-id","prompt":[{"type":"text","text":"hi"}]}}),
+    );
+    let resp = wait_for(&capture, "unknown-session error response", |f| is_response_to(f, 2)).await;
+
+    assert_eq!(
+        resp.pointer("/error/code").and_then(|v| v.as_i64()),
+        Some(-32000),
+        "unknown session must keep code -32000, got: {resp}"
+    );
+    let message = resp
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("error.message must be a string, got: {resp}"));
+    assert!(
+        message.starts_with("ACP framing error: unknown session:"),
+        "unknown-session message text must be preserved verbatim, got: {message}"
+    );
+    assert_eq!(
+        resp.pointer("/error/data/reason").and_then(|v| v.as_str()),
+        Some("unknown_session"),
+        "error.data.reason must identify the unknown-session case, got: {resp}"
+    );
+    assert_eq!(
+        resp.pointer("/error/data/sessionId").and_then(|v| v.as_str()),
+        Some("ghost-session-id"),
+        "error.data.sessionId must echo the offending id, got: {resp}"
+    );
+
+    drop(tx);
+    tokio::time::timeout(std::time::Duration::from_secs(15), server_handle)
+        .await
+        .expect("server task did not join within 15s")
+        .expect("server task panicked")
+        .expect("server run returned error");
+}
+
 // ── Connector-path edge guard (W1-09) ─────────────────────────────────────
 //
 // The 10 goldens above run on BOTH paths (legacy by default; connector under
@@ -3305,5 +3596,388 @@ async fn connector_prompt_before_session_new_errors_not_hang() {
         resp.pointer("/error/code").and_then(|v| v.as_i64()),
         Some(-32602),
         "prompt-before-session/new must return InvalidParams, got {resp}"
+    );
+}
+
+// ── Session persistence + session/load (targets v0.5.0) ───────────────────
+//
+// The host contract these pin (verified against the UE bridge):
+//   1. `initialize` must advertise `agentCapabilities.loadSession: true`
+//      (kill-switch permitting) or the host never attempts a resume.
+//   2. `session/load` params: {sessionId, cwd, mcpServers}. cwd anchors the
+//      storage dir exactly like session/new's cwd does.
+//   3. REPLAY NOTHING during load: the result is an EMPTY object and zero
+//      session/update frames may be emitted for the load.
+//   4. ANY anomaly → JSON-RPC error -32002 ("session not found: <id>"); the
+//      host classifies it resource_not_found and silently falls back to
+//      session/new.
+//   5. After a successful load the SAME sessionId is live for session/prompt
+//      with the persisted history/model (fresh cancel token; MCP reconnects
+//      per normal turn flow).
+//
+// All of these hold PROMPT_SERIAL: the kill-switch test mutates the
+// process-global NWIRO_SHIM_PERSIST env var, which every session/new,
+// initialize, and save path reads.
+
+/// Fresh unique cwd directory for one persistence golden (acts as the "UE
+/// project dir"). Removed best-effort at test end.
+fn persist_test_cwd(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir()
+        .join("nwiro-shim-persist-goldens")
+        .join(format!("{tag}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create persistence test cwd");
+    dir
+}
+
+/// The storage dir the shim derives from a session cwd.
+fn persist_store_for(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join("Saved").join("NwiroIntegrationKit").join("shim-sessions")
+}
+
+/// Write a raw envelope file directly (bypassing the shim) so the -32002
+/// matrix can plant corrupt / mismatched / down-version files.
+fn write_raw_envelope(store: &std::path::Path, file_id: &str, envelope_id: &str, schema_version: u32) {
+    std::fs::create_dir_all(store).expect("create store dir");
+    let v = json!({
+        "schema_version": schema_version,
+        "session_id": envelope_id,
+        "current_model": "test-model",
+        "tool_tier": "none",
+        "history": [{"role": "user", "content": "hello"}],
+        "learned_tool_ceiling": null,
+        "pruned_turn_count": 0,
+        "created_at": 1,
+        "updated_at": 1,
+    });
+    let file = crate::persist::session_file(store, file_id).expect("encodable id");
+    std::fs::write(file, serde_json::to_vec(&v).unwrap()).expect("write envelope file");
+}
+
+/// Restart-resume end-to-end (host-contract items 1/3/5): converse on
+/// instance 1, tear the whole server down, `session/load` the SAME id on a
+/// FRESH server instance over the same storage dir, and prove the next
+/// prompt's mock-received body carries the PRIOR history AND the persisted
+/// per-session model. History/model retention is asserted via what the mock
+/// backend RECEIVES (mock call-count asserts don't enforce in this harness):
+/// the "resumed" mock only matches a body still carrying turn 1's user text +
+/// assistant reply + `"model":"persisted-model"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_persist_restart_resume() {
+    // LEGACY-PATH SPECIFIC: the flag-gated connector path does not participate
+    // in persistence (its session/load answers -32002); skip cleanly there.
+    if std::env::var("LOCAL_LLM_USE_CONNECTOR").as_deref() == Ok("1") {
+        return;
+    }
+    let _serial = PROMPT_SERIAL.lock().await;
+
+    let cwd = persist_test_cwd("resume");
+    let cwd_str = cwd.to_str().expect("utf8 tmp path").to_string();
+
+    let mut mock = mockito::Server::new_async().await;
+    // Resumed round (created FIRST so its specific matcher wins): matches ONLY
+    // when the request body still carries the pre-restart history AND the
+    // persisted model id.
+    let _resumed = mock
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::Regex("remember the codeword pineapple".to_string()),
+            mockito::Matcher::Regex("noted".to_string()),
+            mockito::Matcher::Regex(r#""model":"persisted-model""#.to_string()),
+            mockito::Matcher::Regex("are you still there".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse(&[
+            json!({"choices":[{"delta":{"content":"resumed with context"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]))
+        .create_async()
+        .await;
+    // Turn-1 round (catch-all, created LAST).
+    let _turn1 = mock
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse(&[
+            json!({"choices":[{"delta":{"content":"noted"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]))
+        .create_async()
+        .await;
+
+    // ── Instance 1: create + converse ─────────────────────────────────────
+    let capture1 = CaptureSink::new();
+    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let client1 = openai::Client::new(mock.url(), "test-model".to_string(), None);
+    let server1 = Server::new_with_output(client1, rx1, Arc::new(capture1.clone()));
+    let handle1 = tokio::spawn(server1.run());
+
+    send(&tx1, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    wait_for(&capture1, "initialize response", |f| is_response_to(f, 1)).await;
+    send(
+        &tx1,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new",
+               "params":{"cwd": cwd_str, "mcpServers": []}}),
+    );
+    let new_resp = wait_for(&capture1, "session/new response", |f| is_response_to(f, 2)).await;
+    let sid = new_resp["result"]["sessionId"].as_str().expect("sessionId").to_string();
+    send(
+        &tx1,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option",
+               "params":{"sessionId":sid,"configId":"model","value":"persisted-model"}}),
+    );
+    wait_for(&capture1, "set_config response", |f| is_response_to(f, 3)).await;
+    send(
+        &tx1,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/prompt",
+               "params":{"sessionId":sid,"prompt":[{"type":"text","text":"remember the codeword pineapple"}]}}),
+    );
+    pump_until_response(&capture1, &tx1, 4, vec![]).await;
+
+    // Simulated restart: EOF instance 1 and join it — process state gone,
+    // only the on-disk envelope survives.
+    drop(tx1);
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle1)
+        .await
+        .expect("server 1 did not join within 15s")
+        .expect("server 1 panicked")
+        .expect("server 1 run returned error");
+
+    // The envelope must exist on disk at the contract location.
+    let store = persist_store_for(&cwd);
+    let envelope_file = crate::persist::session_file(&store, &sid).expect("encodable sid");
+    assert!(
+        envelope_file.exists(),
+        "turn-end write must have produced {}",
+        envelope_file.display()
+    );
+
+    // ── Instance 2: fresh server over the same storage dir ────────────────
+    let capture2 = CaptureSink::new();
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let client2 = openai::Client::new(mock.url(), "test-model".to_string(), None);
+    let server2 = Server::new_with_output(client2, rx2, Arc::new(capture2.clone()));
+    let handle2 = tokio::spawn(server2.run());
+
+    send(&tx2, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    wait_for(&capture2, "initialize response", |f| is_response_to(f, 1)).await;
+    send(
+        &tx2,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+               "params":{"sessionId":sid,"cwd":cwd_str,"mcpServers":[]}}),
+    );
+    let load_resp = wait_for(&capture2, "session/load response", |f| is_response_to(f, 2)).await;
+    // Host-contract item 3: an EMPTY OBJECT result (state restored, nothing
+    // replayed — the host ignores/forbids replayed content on load)...
+    assert_eq!(
+        load_resp.get("result"),
+        Some(&json!({})),
+        "session/load must return an empty object result, got: {load_resp}"
+    );
+    // ...and ZERO session/update notifications between the load request and
+    // its response (the dispatcher is the single writer, so any replay would
+    // already be in the capture ahead of the response).
+    assert!(
+        !capture2
+            .frames()
+            .iter()
+            .any(|f| f.get("method").and_then(|m| m.as_str()) == Some("session/update")),
+        "session/load must not replay any session/update frames; frames: {:#?}",
+        capture2.frames()
+    );
+
+    // Host-contract item 5: the SAME sessionId is live for session/prompt and
+    // the resumed turn carries the persisted history + model to the backend.
+    send(
+        &tx2,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+               "params":{"sessionId":sid,"prompt":[{"type":"text","text":"are you still there"}]}}),
+    );
+    let resp = wait_for(&capture2, "resumed prompt response", |f| is_response_to(f, 3)).await;
+    assert_eq!(
+        resp.pointer("/result/stopReason").and_then(|v| v.as_str()),
+        Some("end_turn"),
+        "a prompt on the restored sessionId must succeed, got: {resp}"
+    );
+    assert!(
+        capture2.frames().iter().any(|f| {
+            f.pointer("/params/update/content/text").and_then(|v| v.as_str())
+                == Some("resumed with context")
+        }),
+        "the resumed turn must be served by the mock that requires the persisted \
+         history + model in the request body — state was lost across the restart"
+    );
+
+    drop(tx2);
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle2)
+        .await
+        .expect("server 2 did not join within 15s")
+        .expect("server 2 panicked")
+        .expect("server 2 run returned error");
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// The -32002 anomaly matrix (host-contract item 4): unknown id, corrupt
+/// JSON, wrong schema_version, envelope-id mismatch, invalid cwd, and the
+/// kill switch — every one must answer `-32002` (never -32601/-32000/a crash)
+/// so the host silently falls back to session/new. A positive control at the
+/// top proves the failures aren't a blanket refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_persist_load_error_matrix() {
+    // LEGACY-PATH SPECIFIC: see golden_persist_restart_resume (the connector
+    // path -32002s every load, which would trivially pass the failure half and
+    // fail the positive control).
+    if std::env::var("LOCAL_LLM_USE_CONNECTOR").as_deref() == Ok("1") {
+        return;
+    }
+    let _serial = PROMPT_SERIAL.lock().await;
+
+    let cwd = persist_test_cwd("matrix");
+    let cwd_str = cwd.to_str().expect("utf8 tmp path").to_string();
+    let store = persist_store_for(&cwd);
+    write_raw_envelope(&store, "known-1", "known-1", 1);
+    std::fs::write(
+        crate::persist::session_file(&store, "corrupt-1").unwrap(),
+        b"{ this is not json",
+    )
+    .unwrap();
+    write_raw_envelope(&store, "wrong-ver", "wrong-ver", 999);
+    write_raw_envelope(&store, "mismatch-1", "some-other-id", 1);
+
+    let capture = CaptureSink::new();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let client = openai::Client::new(
+        "http://127.0.0.1:1/v1".to_string(),
+        "test-model".to_string(),
+        None,
+    );
+    let server = Server::new_with_output(client, rx, Arc::new(capture.clone()));
+    let server_handle = tokio::spawn(server.run());
+
+    send(&tx, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    wait_for(&capture, "initialize response", |f| is_response_to(f, 1)).await;
+
+    let load = |id: i64, session_id: &str, cwd: &str| {
+        json!({"jsonrpc":"2.0","id":id,"method":"session/load",
+               "params":{"sessionId":session_id,"cwd":cwd,"mcpServers":[]}})
+    };
+
+    // Positive control: a valid envelope loads with an empty-object result.
+    send(&tx, load(2, "known-1", &cwd_str));
+    let ok = wait_for(&capture, "positive-control load", |f| is_response_to(f, 2)).await;
+    assert_eq!(ok.get("result"), Some(&json!({})), "control load must succeed: {ok}");
+
+    // The matrix: (request id, sessionId, cwd, what it exercises).
+    let cases: Vec<(i64, &str, &str, &str)> = vec![
+        (3, "ghost-session", &cwd_str, "unknown id (no file)"),
+        (4, "corrupt-1", &cwd_str, "corrupt JSON"),
+        (5, "wrong-ver", &cwd_str, "wrong schema_version"),
+        (6, "mismatch-1", &cwd_str, "envelope id != requested id"),
+        (7, "known-1", "relative/not-absolute", "invalid cwd"),
+        (8, "", &cwd_str, "empty sessionId"),
+    ];
+    for (id, session_id, case_cwd, what) in cases {
+        send(&tx, load(id, session_id, case_cwd));
+        let resp = wait_for(&capture, what, |f| is_response_to(f, id)).await;
+        assert_eq!(
+            resp.pointer("/error/code").and_then(|v| v.as_i64()),
+            Some(-32002),
+            "{what}: session/load must answer -32002, got: {resp}"
+        );
+        let msg = resp
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with("session not found"),
+            "{what}: message must read 'session not found: <id>', got: {msg}"
+        );
+    }
+
+    // Kill switch: with NWIRO_SHIM_PERSIST=0, even the VALID envelope must
+    // -32002 (persistence disabled ⇒ load always fails; host falls back).
+    std::env::set_var("NWIRO_SHIM_PERSIST", "0");
+    let _g = EnvGuard("NWIRO_SHIM_PERSIST");
+    send(&tx, load(9, "known-1", &cwd_str));
+    let resp = wait_for(&capture, "disabled load", |f| is_response_to(f, 9)).await;
+    assert_eq!(
+        resp.pointer("/error/code").and_then(|v| v.as_i64()),
+        Some(-32002),
+        "kill switch: session/load must answer -32002 while disabled, got: {resp}"
+    );
+
+    drop(tx);
+    tokio::time::timeout(std::time::Duration::from_secs(15), server_handle)
+        .await
+        .expect("server task did not join within 15s")
+        .expect("server task panicked")
+        .expect("server run returned error");
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// Kill switch ⇄ capability advertisement (host-contract item 1): by default
+/// `initialize` advertises `loadSession: true`; with `NWIRO_SHIM_PERSIST=0`
+/// it must advertise `false` (the host then never attempts session/load).
+#[tokio::test]
+async fn golden_persist_kill_switch_gates_loadsession_capability() {
+    let _serial = PROMPT_SERIAL.lock().await;
+
+    let load_session = |frames: &[serde_json::Value]| -> Option<bool> {
+        frames
+            .iter()
+            .find(|f| f.get("id").and_then(|v| v.as_i64()) == Some(1))
+            .and_then(|f| f.pointer("/result/agentCapabilities/loadSession"))
+            .and_then(|v| v.as_bool())
+    };
+
+    // Default (env absent): persistence is ON, capability advertised.
+    std::env::remove_var("NWIRO_SHIM_PERSIST");
+    let frames = drive_to_completion(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    ])
+    .await;
+    assert_eq!(
+        load_session(&frames),
+        Some(true),
+        "default initialize must advertise loadSession: true; frames: {frames:?}"
+    );
+
+    // Kill switch: loadSession must be false so the host never attempts resume.
+    std::env::set_var("NWIRO_SHIM_PERSIST", "0");
+    let _g = EnvGuard("NWIRO_SHIM_PERSIST");
+    let frames = drive_to_completion(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    ])
+    .await;
+    assert_eq!(
+        load_session(&frames),
+        Some(false),
+        "NWIRO_SHIM_PERSIST=0 must advertise loadSession: false; frames: {frames:?}"
+    );
+}
+
+/// Connector-path guard: the flag-gated connector path (non-default) does not
+/// implement persistence — its `session/load` must answer `-32002` (so a host
+/// that saw `loadSession: true` still degrades cleanly to session/new), never
+/// hang or -32601.
+#[tokio::test]
+async fn connector_session_load_returns_resource_not_found() {
+    let _serial = PROMPT_SERIAL.lock().await;
+    std::env::set_var("LOCAL_LLM_USE_CONNECTOR", "1");
+    let _g = EnvGuard("LOCAL_LLM_USE_CONNECTOR");
+
+    let frames = drive_to_completion(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"any-id","cwd":"C:/nowhere","mcpServers":[]}}"#,
+    ])
+    .await;
+    let resp = frames
+        .iter()
+        .find(|f| f.get("id").and_then(|v| v.as_i64()) == Some(2))
+        .unwrap_or_else(|| panic!("no response for session/load; frames={frames:?}"));
+    assert_eq!(
+        resp.pointer("/error/code").and_then(|v| v.as_i64()),
+        Some(-32002),
+        "connector session/load must answer -32002, got: {resp}"
     );
 }

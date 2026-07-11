@@ -90,6 +90,11 @@ impl From<ShimError> for ConnectorError {
     fn from(e: ShimError) -> Self {
         match e {
             ShimError::AcpFraming(m) => ConnectorError::Internal(m),
+            // Same taxonomy the connector's own session lookup uses
+            // (`InvalidParams("unknown session")` in local_openai.rs).
+            ShimError::UnknownSession(sid) => {
+                ConnectorError::InvalidParams(format!("unknown session: {sid}"))
+            }
             ShimError::OpenAiHttp(m) => ConnectorError::Transport(m),
             ShimError::Config(m) => ConnectorError::InvalidParams(m),
             ShimError::McpRoundtrip(m) => ConnectorError::ToolTransport(m),
