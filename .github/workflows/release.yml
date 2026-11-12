@@ -85,17 +85,18 @@ jobs:
             os: windows-11-arm
             ext: zip
 
-          # macOS: BOTH arches build on the macos-14 (Apple Silicon) runner.
+          # macOS: BOTH arches build on the macos-15 (Apple Silicon) runner
+          # (macos-14 until GitHub retired that image on 2026-11-02).
           # x86_64 is CROSS-compiled there — Apple's toolchain is multi-arch —
           # which sidesteps the flaky macos-13 Intel runner that caused the
           # v0.1.13 Intel removal. Deployment target is pinned to 11.0 (job env
           # above), so both macOS binaries require macOS 11 (Big Sur) or later.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             ext: tar.gz
 
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             ext: tar.gz
 
           - target: x86_64-unknown-linux-gnu
@@ -112,8 +113,8 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     env:
-      # macOS: pin the deployment target so the macos-14 runner doesn't link
-      # against macOS 14 SDK symbols and dyld-crash on macOS 11–13 Apple Silicon
+      # macOS: pin the deployment target so the macos-15 runner doesn't link
+      # against macOS 15 SDK symbols and dyld-crash on macOS 11–14 Apple Silicon
       # Macs. Quoted so YAML keeps it the string "11.0" (not the float 11).
       # Harmless on Windows/Linux — only the Apple linker reads it. Symbol
       # stripping is handled by Cargo.toml [profile.release] strip=true, so no

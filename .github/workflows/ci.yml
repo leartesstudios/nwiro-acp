@@ -36,7 +36,7 @@ jobs:
           # arm64 so mac-specific compile/link/test breaks surface on the PR
           # instead of at release. The Unix logic overlaps with ubuntu, so this
           # is mainly a macOS toolchain/link guard.
-          - os: macos-14
+          - os: macos-15
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5

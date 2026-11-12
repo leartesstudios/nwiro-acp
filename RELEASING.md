@@ -52,13 +52,14 @@ single file — this guarantees a flat structure regardless of tooling.
 |--------------------------------|----------------------|------------------|----------------|
 | `x86_64-pc-windows-msvc`       | Windows x64          | `windows-latest` | Native cargo   |
 | `aarch64-pc-windows-msvc`      | Windows ARM64        | `windows-11-arm` | Native cargo   |
-| `aarch64-apple-darwin`         | macOS Apple Silicon  | `macos-14`       | Native cargo   |
-| `x86_64-apple-darwin`          | macOS Intel          | `macos-14`       | Cross (native SDK) |
+| `aarch64-apple-darwin`         | macOS Apple Silicon  | `macos-15`       | Native cargo   |
+| `x86_64-apple-darwin`          | macOS Intel          | `macos-15`       | Cross (native SDK) |
 | `x86_64-unknown-linux-gnu`     | Linux x64            | `ubuntu-latest`  | cargo-zigbuild |
 | `aarch64-unknown-linux-gnu`    | Linux ARM64          | `ubuntu-latest`  | cargo-zigbuild |
 
 > **macOS Intel (`x86_64-apple-darwin`) was dropped in v0.1.13 and re-added** by
-> CROSS-compiling on the `macos-14` (Apple Silicon) runner instead of the flaky
+> CROSS-compiling on an Apple Silicon runner (`macos-14`; `macos-15` since GitHub retired
+> the macOS 14 image on 2026-11-02) instead of the flaky
 > `macos-13` Intel runner that caused the original removal. Both macOS binaries are
 > pinned to `MACOSX_DEPLOYMENT_TARGET=11.0`, so they require macOS 11 (Big Sur)+
 > (Intel Macs on Catalina 10.15 or earlier are not covered).
