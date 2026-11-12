@@ -26,12 +26,14 @@ prompt still fails — you have to fix the backend.)
 | Backend | Default `n_ctx` | Recommended | Notes |
 |---|---|---|---|
 | **LM Studio** | 4096 | **≥ 65536** | Model load dialog → "Context Length". 32K is a thin floor (observed `n_keep` was 29.7K). |
-| **Ollama** | 2048 | **≥ 65536** | Modelfile: `PARAMETER num_ctx 65536`, or env: `OLLAMA_NUM_CTX=65536` |
+| **Ollama** | by VRAM: 4k (< 24 GiB), 32k (24–48 GiB), 256k (≥ 48 GiB) | **≥ 65536** (never above the model's trained length) | App: Settings → **Context length** slider · env: `OLLAMA_CONTEXT_LENGTH=65536` · Modelfile: `PARAMETER num_ctx 65536`. There is no `OLLAMA_NUM_CTX`, and Ollama caps the value at the model's trained length — see [Ollama: setting and capping the context length](#ollama-setting-and-capping-the-context-length). |
 | **llama.cpp server** | from `--ctx-size` flag | `--ctx-size 65536` | Watch VRAM — bigger context = bigger KV cache |
 | **vLLM** | from `--max-model-len` flag | `--max-model-len 65536` | Must be ≤ model architectural max |
 
 Model architectural ceilings (most chat-tuned models support these natively):
-- Qwen 2.5 / 3: 32K base, 128K with YaRN
+- Qwen 2.5: 32K (32,768) · Qwen 3 dense models such as `qwen3:14b`: 40,960. YaRN
+  stretches them to 128K, but Ollama never serves a model above the context length
+  stored in its model file — see the Ollama notes below
 - GLM-4-9B-chat: 32K native
 - Llama 3.1: 128K native (use a smaller load for VRAM efficiency)
 - Kimi-K2: 128K native
@@ -39,6 +41,43 @@ Model architectural ceilings (most chat-tuned models support these natively):
 **If you only have a small VRAM budget** and can't fit 64K context: ask
 the bridge to send a *subset* of the tool registry (Fix C — bridge tool
 partitioning, future work). Until that ships, 64K is the practical floor.
+
+### Ollama: setting and capping the context length
+
+> Checked against Ollama 0.33.3 (`ollama serve --help`, docs.ollama.com/context-length,
+> and `llm/server.go`).
+
+**There is no `OLLAMA_NUM_CTX`.** Earlier revisions of this page and of the shim's log
+messages named it, but the only context-length variable Ollama has is
+`OLLAMA_CONTEXT_LENGTH`. The ways that do exist:
+
+| Where | How |
+|---|---|
+| Ollama app | **Settings** → drag the **Context length** slider |
+| Server environment | `OLLAMA_CONTEXT_LENGTH=65536` before `ollama serve` (restart the server); the default for every model that does not set its own |
+| One model | Modelfile `PARAMETER num_ctx 65536`, then `ollama create <name> -f <Modelfile>` (see §8.1) |
+
+The shim talks to Ollama's OpenAI-compatible `/v1` endpoint, which cannot set the
+context size per request, so one of the three has to be set on the Ollama side.
+`ollama ps` lists the context a loaded model is actually running with (`CONTEXT`
+column) — check it after changing the setting.
+
+**The default depends on your VRAM** (it is no longer 2048): **4k below 24 GiB, 32k
+from 24 to 48 GiB, 256k at 48 GiB and up.** Most consumer GPUs therefore start at 4k,
+and even the 32k tier leaves little room beyond a ~28-30K-token tool array (see above).
+
+**Ollama caps `num_ctx` at the model's trained context length.** A larger value is
+lowered to the model's own limit without an error — only the Ollama server log shows
+`requested context size too large for model`. So `≥ 65536` can only be met by a model
+trained that long, and two models this repo uses cannot: **`qwen2.5` is trained for
+32,768 tokens and the Qwen 3 dense models such as `qwen3:14b` for 40,960.** On Ollama
+they stop there however high you set the context. `ollama show <model>` prints the
+limit (the `context length` row).
+
+For a model capped below 65536, treat its trained length as your `n_ctx`: lower the
+shim's thresholds to match, as described under "If you must run with a smaller backend
+context" in [Shim-side defaults](#shim-side-defaults-v0125) below, or choose a model
+trained for 65536 or more.
 
 ### ⚠️ Chat-template compatibility (v0.1.27+)
 
@@ -662,6 +701,11 @@ PARAMETER keep_alive 15m
 > "Shim-side defaults" section above — you can lower the shim's
 > warn/prune env vars to match a smaller backend ceiling, but the
 > backend itself must still accept whatever payload the bridge sends.
+>
+> Ollama also caps `num_ctx` at the context length stored in the GGUF. After
+> `ollama create`, run `ollama show qwen3-30b-a3b`: if its `context length` is
+> below 65536, that is the limit you really have — see
+> [Ollama: setting and capping the context length](#ollama-setting-and-capping-the-context-length).
 
 **Register the model with Ollama:**
 ```powershell

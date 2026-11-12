@@ -22,6 +22,9 @@ shim_bin = "target/release/local-llm-acp.exe"
 [[model]]
 id = "qwen3:14b"
 role = "green-anchor"               # REFERENCE PASS — every run diffs against it
+# Context length: Ollama caps num_ctx at the model's trained length (40,960 for qwen3:14b), so the
+# n_ctx >= 65536 advice in docs/MODEL-SETUP.md cannot be met on Ollama (see "Ollama: setting and
+# capping the context length" there). Check any model with `ollama show <model>`.
 backend = "ollama"
 base_url = "http://127.0.0.1:11434/v1"
 expected_tier = "native"
@@ -59,6 +62,7 @@ timeout_secs = 240
 [[model]]
 id = "qwen2.5:7b-instruct"
 role = "qwen-floor"
+# Context length: trained length is 32,768, which Ollama will not exceed (same cap as qwen3:14b above).
 backend = "ollama"
 base_url = "http://127.0.0.1:11434/v1"
 expected_tier = "native"
