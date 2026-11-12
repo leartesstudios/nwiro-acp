@@ -1339,7 +1339,9 @@ where
                 tool_round,
                 "prompt payload for Nwiro Pro's full tool array exceeds warn_threshold — \
                  ensure backend n_ctx is at least {recommended_n_ctx} (LM Studio Context \
-                 Length, OLLAMA_NUM_CTX, --ctx-size {recommended_n_ctx}). See \
+                 Length; Ollama: app Settings > Context length, OLLAMA_CONTEXT_LENGTH or \
+                 `PARAMETER num_ctx` in a Modelfile, never above the model's trained length; \
+                 llama.cpp: --ctx-size {recommended_n_ctx}). See \
                  docs/MODEL-SETUP.md for the recommended configuration."
             );
         }
@@ -1364,7 +1366,9 @@ where
             return Err(ShimError::OpenAiHttp(format!(
                 "prompt payload estimated at ~{payload_est} tokens, exceeds 2× warn_threshold \
                  ({warn_threshold}×2 = {}); this is past the recommended n_ctx budget. \
-                 Increase backend n_ctx (LM Studio Context Length, OLLAMA_NUM_CTX) \
+                 Increase backend n_ctx (LM Studio Context Length; Ollama: app Settings > \
+                 Context length, OLLAMA_CONTEXT_LENGTH or `PARAMETER num_ctx` in a Modelfile, \
+                 never above the model's trained length) \
                  OR set NWIRO_LOCAL_LLM_WARN_TOKEN_THRESHOLD higher to raise the backstop.",
                 warn_threshold.saturating_mul(2)
             )));

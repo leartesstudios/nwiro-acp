@@ -111,7 +111,9 @@ weak model competent (model fitness is out of scope; the fix for a weak model is
 better model).
 
 - **Tool-heavy work:** use **`qwen3:14b` or larger** — the validated 🟢 reference
-  (Native tool calls at the full 220-tool registry).
+  (Native tool calls at the full 220-tool registry). On Ollama its context tops out at
+  the trained 40,960 tokens, below the `n_ctx ≥ 65536` advice under
+  [Limitations](#limitations).
 - **Small / chat-only models** (e.g. GLM-4-9B-Chat) run, but **collapse above ~30
   tools** — a 9B model can't hold ~220 tool schemas (~25K tokens) in context, so
   the shim returns one clean refusal instead. They're fine for chat, not for tool
@@ -186,7 +188,13 @@ that it did.
 - **Large tool array needs a large `n_ctx`.** The bridge pushes the full tool
   registry on every prompt (~25-30K tokens for 100+ tools). Backends loaded with a
   small `n_ctx` (LM Studio default 4096) refuse with `n_keep >= n_ctx`. Load with
-  `n_ctx ≥ 65536`; see [`docs/MODEL-SETUP.md`](docs/MODEL-SETUP.md).
+  `n_ctx ≥ 65536`; see [`docs/MODEL-SETUP.md`](docs/MODEL-SETUP.md). On **Ollama** the
+  context is set with the app's *Settings → Context length* slider,
+  `OLLAMA_CONTEXT_LENGTH`, or `PARAMETER num_ctx` in a Modelfile (there is no
+  `OLLAMA_NUM_CTX`), its default depends on VRAM (4k under 24 GiB), and it is capped at
+  the model's trained length — 32,768 for `qwen2.5`, 40,960 for `qwen3:14b` — so those
+  models cannot reach 65536 there. Details:
+  [Ollama: setting and capping the context length](docs/MODEL-SETUP.md#ollama-setting-and-capping-the-context-length).
 - **No vision / mixed-content prompts.** `session/prompt` blocks of a type other
   than `text` are silently dropped. Image support is future work, not implemented.
 

@@ -130,6 +130,11 @@ ollama pull llama3.2:3b           # tiny, fast, good for smoke tests
 ollama pull qwen2.5:14b           # bigger, tool-capable
 ```
 
+> **Context length.** Ollama picks its default context by VRAM (4k under 24 GiB) and
+> never goes above the model's trained length (32,768 for `qwen2.5`). For tool use,
+> raise it yourself, up to what the model allows — see
+> [`MODEL-SETUP.md`](MODEL-SETUP.md#ollama-setting-and-capping-the-context-length).
+
 Model lifecycle:
 ```bash
 ollama list                       # what's downloaded
